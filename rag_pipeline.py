@@ -24,6 +24,7 @@ from llama_index.core.node_parser import SemanticSplitterNodeParser
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import QueryFusionRetriever, VectorIndexRetriever
+from llama_index.core.vector_stores.types import MetadataFilter, MetadataFilters
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.llama_cpp import LlamaCPP
 from llama_index.retrievers.bm25 import BM25Retriever
@@ -52,6 +53,20 @@ _PHARMA_QA_PROMPT = PromptTemplate(
 # Scanned page detection threshold: pages with fewer characters than this
 # are assumed to be image-based and will be re-processed with Tesseract OCR.
 _SCANNED_PAGE_CHAR_THRESHOLD = 100
+
+# Recognised pharmaceutical document categories used by query and document
+# classification.  Values are snake_case strings stored in the
+# ``pharma_doc_type`` metadata field on every chunk.
+_PHARMA_DOC_CATEGORIES: List[str] = [
+    "cover_letter",
+    "certificate_of_quality",
+    "packaging_specification",
+    "bse_tse_declaration",
+    "material_description",
+    "supplier_qualification",
+    "chain_of_custody",
+    "unknown",
+]
 
 # DPI used when rasterising a PDF page for OCR. 300 dpi gives a good
 # balance between OCR accuracy and memory usage.
@@ -152,6 +167,7 @@ class RAGPipeline:
         self._vector_index: Optional[VectorStoreIndex] = None
         self._query_engine: Optional[RetrieverQueryEngine] = None
         self._pdf_path: Optional[str] = None
+        self._docs_classified: bool = False
 
     # ------------------------------------------------------------------
     # PDF Loading
@@ -318,22 +334,157 @@ class RAGPipeline:
         return hybrid_retriever
 
     # ------------------------------------------------------------------
+    # Document & Query Classification
+    # ------------------------------------------------------------------
+
+    def _classify_query(self, query: str) -> str:
+        """Classify a natural-language query into a pharma document category.
+
+        Uses the LLM to determine which type of pharmaceutical document is most
+        likely to contain the answer, enabling targeted retrieval.
+
+        Args:
+            query: The user's natural-language question.
+
+        Returns:
+            A snake_case category string from :data:`_PHARMA_DOC_CATEGORIES`.
+            Falls back to ``"unknown"`` if the LLM response is ambiguous.
+        """
+        categories_str = ", ".join(_PHARMA_DOC_CATEGORIES)
+        prompt = (
+            "You are an expert pharmaceutical document classifier.\n"
+            "Given a user query, identify which document type most likely contains the answer.\n"
+            f"Choose exactly one from: {categories_str}.\n"
+            "Respond with only the category name in snake_case. No extra text.\n\n"
+            f"Query: {query}\n"
+            "Category:"
+        )
+        response = self.llm.complete(prompt)
+        raw = response.text.strip().split()[-1].strip().lower() if response.text.strip() else ""
+        result = raw if raw in _PHARMA_DOC_CATEGORIES else "unknown"
+        logger.info("Query classified as: %s", result)
+        return result
+
+    def _classify_document(self, text: str) -> str:
+        """Classify a page of document text into a pharma document category.
+
+        Args:
+            text: Raw text extracted from a single PDF page.
+
+        Returns:
+            A snake_case category string from :data:`_PHARMA_DOC_CATEGORIES`.
+        """
+        categories_str = ", ".join(_PHARMA_DOC_CATEGORIES)
+        prompt = (
+            "You are an expert pharmaceutical document classifier.\n"
+            "Given a page of text from a pharmaceutical document, identify its type.\n"
+            f"Choose exactly one from: {categories_str}.\n"
+            "Respond with only the category name in snake_case. No extra text.\n\n"
+            f"Document text:\n{text[:600]}\n\n"
+            "Category:"
+        )
+        response = self.llm.complete(prompt)
+        raw = response.text.strip().split()[-1].strip().lower() if response.text.strip() else ""
+        return raw if raw in _PHARMA_DOC_CATEGORIES else "unknown"
+
+    def _annotate_pharma_doc_types(self, documents: List[Document]) -> List[Document]:
+        """Add a ``pharma_doc_type`` metadata field to each document via LLM classification.
+
+        Args:
+            documents: Pages loaded by :meth:`load_pdf`.
+
+        Returns:
+            The same list with ``pharma_doc_type`` set on every document's metadata.
+        """
+        logger.info("Classifying %d pages into pharma doc types...", len(documents))
+        for i, doc in enumerate(documents):
+            doc_type = self._classify_document(doc.text)
+            doc.metadata["pharma_doc_type"] = doc_type
+            logger.debug("Page %d → %s", doc.metadata.get("page_number", i + 1), doc_type)
+        logger.info("Document classification complete.")
+        return documents
+
+    def _build_filtered_engine(self, pharma_doc_type: str) -> RetrieverQueryEngine:
+        """Build a query engine whose retrieval is scoped to a single pharma doc type.
+
+        Both the vector retriever (via :class:`MetadataFilters`) and the BM25
+        retriever (via pre-filtered node list) are restricted to chunks whose
+        ``pharma_doc_type`` metadata matches *pharma_doc_type*.
+
+        Args:
+            pharma_doc_type: A category string from :data:`_PHARMA_DOC_CATEGORIES`.
+
+        Returns:
+            A :class:`~llama_index.core.query_engine.RetrieverQueryEngine` scoped
+            to the requested document category.
+
+        Raises:
+            RuntimeError: If :meth:`build` has not been called yet.
+        """
+        if self._vector_index is None:
+            raise RuntimeError("Pipeline not built. Call build(pdf_path) first.")
+
+        filters = MetadataFilters(
+            filters=[MetadataFilter(key="pharma_doc_type", value=pharma_doc_type)]
+        )
+        vector_retriever = VectorIndexRetriever(
+            index=self._vector_index,
+            similarity_top_k=self.similarity_top_k,
+            filters=filters,
+        )
+
+        filtered_chunks = [
+            c for c in self._chunks
+            if c.metadata.get("pharma_doc_type") == pharma_doc_type
+        ]
+        if filtered_chunks:
+            bm25_retriever = BM25Retriever.from_defaults(
+                nodes=filtered_chunks,
+                similarity_top_k=min(self.similarity_top_k, len(filtered_chunks)),
+            )
+            retrievers: List[Any] = [vector_retriever, bm25_retriever]
+        else:
+            retrievers = [vector_retriever]
+
+        hybrid_retriever = QueryFusionRetriever(
+            retrievers=retrievers,
+            similarity_top_k=self.similarity_top_k,
+            num_queries=self.num_queries,
+            mode="reciprocal_rerank",
+            use_async=False,
+            llm=self.llm,
+        )
+        return RetrieverQueryEngine.from_args(
+            retriever=hybrid_retriever,
+            llm=self.llm,
+            text_qa_template=_PHARMA_QA_PROMPT,
+        )
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def build(self, pdf_path: str) -> None:
+    def build(self, pdf_path: str, classify_docs: bool = False) -> None:
         """Index a PDF document and prepare the query engine.
 
         This method runs the full ingestion pipeline:
-        load → chunk → embed & index → build hybrid retriever → attach query engine.
+        load → (classify) → chunk → embed & index → build hybrid retriever → attach query engine.
 
         Call this once per document. Calling it again replaces the current index.
 
         Args:
             pdf_path: Path to the PDF file to ingest.
+            classify_docs: When ``True``, each page is classified by the LLM and
+                its ``pharma_doc_type`` is stored in chunk metadata.  This enables
+                targeted retrieval via the ``classify`` parameter on :meth:`query`
+                and :meth:`query_with_sources`.  Adds one LLM call per page, so
+                it is ``False`` by default.
         """
         self._pdf_path = pdf_path
         documents = self.load_pdf(pdf_path)
+        if classify_docs:
+            documents = self._annotate_pharma_doc_types(documents)
+        self._docs_classified = classify_docs
         self._chunks = self._chunk(documents)
         self._vector_index = self._index(self._chunks)
         hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
@@ -378,6 +529,7 @@ class RAGPipeline:
         question: str,
         expand: bool = False,
         num_expansions: int = 3,
+        classify: bool = False,
     ) -> str:
         """Query the pipeline and return a plain-text answer.
 
@@ -387,6 +539,10 @@ class RAGPipeline:
                 alternative phrasings before retrieval. Increases latency.
             num_expansions: Number of query expansions to generate when
                 ``expand=True``.
+            classify: If ``True``, classify the query into a pharma document
+                category and restrict retrieval to matching chunks.  Requires
+                the index to have been built with ``classify_docs=True``; if
+                not, classification still runs but no filtering is applied.
 
         Returns:
             The LLM's answer as a plain string, including inline citations
@@ -403,7 +559,13 @@ class RAGPipeline:
             queries = self.expand_query(question, num_expansions=num_expansions)
             search_query = queries[1] if len(queries) > 1 else question
 
-        response = self._query_engine.query(search_query)
+        engine = self._query_engine
+        if classify and self._docs_classified:
+            query_category = self._classify_query(search_query)
+            if query_category != "unknown":
+                engine = self._build_filtered_engine(query_category)
+
+        response = engine.query(search_query)
         return str(response)
 
     def query_with_sources(
@@ -411,6 +573,7 @@ class RAGPipeline:
         question: str,
         expand: bool = False,
         num_expansions: int = 3,
+        classify: bool = False,
     ) -> Dict[str, Any]:
         """Query the pipeline and return a structured result with sources and confidence.
 
@@ -424,6 +587,11 @@ class RAGPipeline:
             expand: If ``True``, expand the query before retrieval. See
                 :meth:`expand_query` for details.
             num_expansions: Number of query expansions when ``expand=True``.
+            classify: If ``True``, classify the query into a pharma document
+                category and restrict retrieval to matching chunks.  Requires
+                the index to have been built with ``classify_docs=True``; if
+                not, classification still runs but no filtering is applied.
+                The detected category is returned under ``query_category``.
 
         Returns:
             A dictionary with the following keys:
@@ -436,8 +604,12 @@ class RAGPipeline:
               - ``page`` – 1-based page number.
               - ``score`` – Confidence percentage (0–100), relative to top chunk.
               - ``doc_type`` – ``"digital"`` or ``"scanned"``.
+              - ``pharma_doc_type`` – Pharma category label (``"unknown"`` if
+                documents were not classified during build).
 
             - ``chunk_count`` (*int*) – Number of chunks retrieved.
+            - ``query_category`` (*str | None*) – Pharma category the query was
+              classified into, or ``None`` if ``classify=False``.
 
         Raises:
             RuntimeError: If :meth:`build` has not been called yet.
@@ -450,7 +622,14 @@ class RAGPipeline:
             queries = self.expand_query(question, num_expansions=num_expansions)
             search_query = queries[1] if len(queries) > 1 else question
 
-        response = self._query_engine.query(search_query)
+        query_category: Optional[str] = None
+        engine = self._query_engine
+        if classify:
+            query_category = self._classify_query(search_query)
+            if self._docs_classified and query_category != "unknown":
+                engine = self._build_filtered_engine(query_category)
+
+        response = engine.query(search_query)
 
         raw_scores = [n.score for n in response.source_nodes if n.score is not None]
         max_score = max(raw_scores) if raw_scores else 0.0
@@ -468,10 +647,12 @@ class RAGPipeline:
                 "page": meta.get("page_number", "?"),
                 "score": confidence,
                 "doc_type": meta.get("doc_type", "digital"),
+                "pharma_doc_type": meta.get("pharma_doc_type", "unknown"),
             })
 
         return {
             "answer": str(response),
             "sources": sources,
             "chunk_count": len(sources),
+            "query_category": query_category,
         }
