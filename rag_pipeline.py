@@ -15,12 +15,14 @@ LLM             : Mistral GGUF (local, via llama-cpp-python)
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 import fitz  # PyMuPDF
+import torch
 from dotenv import load_dotenv
-from llama_index.core import Document, Settings, VectorStoreIndex
-from llama_index.core.node_parser import SemanticSplitterNodeParser
+from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex, load_index_from_storage
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import QueryFusionRetriever, VectorIndexRetriever
@@ -68,9 +70,9 @@ _PHARMA_DOC_CATEGORIES: List[str] = [
     "unknown",
 ]
 
-# DPI used when rasterising a PDF page for OCR. 300 dpi gives a good
-# balance between OCR accuracy and memory usage.
-_OCR_DPI = 300
+# DPI used when rasterising a PDF page for OCR. 200 dpi gives a good
+# balance between OCR accuracy, memory usage, and speed.
+_OCR_DPI = 200
 
 
 class RAGPipeline:
@@ -94,6 +96,7 @@ class RAGPipeline:
         similarity_top_k: Optional[int] = None,
         num_queries: int = 1,
         n_gpu_layers: Optional[int] = None,
+        persist_dir: Optional[str] = None,
     ) -> None:
         """Initialise the RAG pipeline by loading the LLM and embedding model.
 
@@ -105,13 +108,16 @@ class RAGPipeline:
                 Falls back to ``EMBED_MODEL`` env var, then ``all-MiniLM-L6-v2``.
             similarity_top_k: Number of top-ranked chunks returned by each
                 individual retriever (vector and BM25) before fusion.
-                Falls back to ``SIMILARITY_TOP_K`` env var, then ``5``.
+                Falls back to ``SIMILARITY_TOP_K`` env var, then ``3``.
             num_queries: Number of LLM-generated query variants used by
                 :class:`QueryFusionRetriever`. Set to ``1`` to disable
                 internal query expansion (recommended for speed).
             n_gpu_layers: Number of model layers offloaded to GPU.
                 ``-1`` offloads all layers (requires CUDA). ``0`` runs on CPU only.
                 Falls back to ``N_GPU_LAYERS`` env var, then ``-1``.
+            persist_dir: Directory path for persisting the vector index.
+                If provided, the index will be saved after building and loaded
+                on subsequent runs, eliminating rebuild time.
 
         Raises:
             FileNotFoundError: If the resolved ``model_path`` does not exist.
@@ -129,7 +135,7 @@ class RAGPipeline:
         _top_k: int = (
             similarity_top_k
             if similarity_top_k is not None
-            else int(os.getenv("SIMILARITY_TOP_K", "5"))
+            else int(os.getenv("SIMILARITY_TOP_K", "3"))
         )
         _gpu_layers: int = (
             n_gpu_layers
@@ -146,22 +152,26 @@ class RAGPipeline:
         self.llm: LlamaCPP = LlamaCPP(
             model_path=_model_path,
             temperature=0.1,
-            max_new_tokens=1024,
-            context_window=32768,
+            max_new_tokens=512,
+            context_window=4096,
             model_kwargs={"n_gpu_layers": _gpu_layers},
             verbose=False,
         )
 
         self.embed_model: HuggingFaceEmbedding = HuggingFaceEmbedding(
-            model_name=_embed_model
+            model_name=_embed_model,
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
         Settings.embed_model = self.embed_model
         Settings.llm = self.llm
 
-        self._splitter: SemanticSplitterNodeParser = SemanticSplitterNodeParser(
-            embed_model=self.embed_model
+        self._splitter: SentenceSplitter = SentenceSplitter(
+            chunk_size=512,
+            chunk_overlap=50
         )
+
+        self.persist_dir: Optional[str] = persist_dir
 
         self._chunks: List[Any] = []
         self._vector_index: Optional[VectorStoreIndex] = None
@@ -194,8 +204,8 @@ class RAGPipeline:
 
         Pages with fewer than :data:`_SCANNED_PAGE_CHAR_THRESHOLD` characters of
         extracted text are treated as scanned/image-based and re-processed with
-        Tesseract OCR (when available). Pages that yield no text after both
-        methods are skipped entirely.
+        Tesseract OCR (when available) in parallel. Pages that yield no text after
+        both methods are skipped entirely.
 
         Args:
             pdf_path: Absolute or relative path to the PDF file.
@@ -215,14 +225,38 @@ class RAGPipeline:
         file_name = os.path.basename(pdf_path)
 
         with fitz.open(pdf_path) as doc:
+            # First pass: extract text and identify pages needing OCR
+            page_data = []
             for i, page in enumerate(doc):
                 text = page.get_text()
+                page_data.append((i, page, text))
+            
+            # Parallel OCR processing for scanned pages
+            if _OCR_AVAILABLE:
+                pages_needing_ocr = [
+                    (i, page) for i, page, text in page_data
+                    if len(text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD
+                ]
+                
+                if pages_needing_ocr:
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        ocr_results = list(executor.map(
+                            lambda p: (p[0], self._ocr_page(p[1])),
+                            pages_needing_ocr
+                        ))
+                    ocr_dict = dict(ocr_results)
+                else:
+                    ocr_dict = {}
+            else:
+                ocr_dict = {}
+            
+            # Build documents
+            for i, page, text in page_data:
                 ocr_used = False
-
-                if len(text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD and _OCR_AVAILABLE:
-                    text = self._ocr_page(page)
+                if i in ocr_dict:
+                    text = ocr_dict[i]
                     ocr_used = True
-
+                
                 if not text.strip():
                     continue
 
@@ -248,11 +282,11 @@ class RAGPipeline:
     # ------------------------------------------------------------------
 
     def _chunk(self, documents: List[Document]) -> List[Any]:
-        """Split documents into semantically coherent chunks.
+        """Split documents into fixed-size chunks with overlap.
 
-        Uses :class:`~llama_index.core.node_parser.SemanticSplitterNodeParser`
-        which groups sentences by embedding similarity rather than by a fixed
-        character/token count.
+        Uses :class:`~llama_index.core.node_parser.SentenceSplitter`
+        which splits text into chunks of approximately 512 tokens with
+        50 token overlap for context preservation.
 
         Args:
             documents: List of :class:`~llama_index.core.Document` objects
@@ -267,7 +301,7 @@ class RAGPipeline:
         """
         if not documents:
             raise ValueError("No documents provided for chunking.")
-        logger.info("Performing semantic chunking...")
+        logger.info("Performing fixed-size chunking...")
         chunks = self._splitter.get_nodes_from_documents(documents)
         logger.info("Total chunks created: %d", len(chunks))
         return chunks
@@ -277,7 +311,10 @@ class RAGPipeline:
     # ------------------------------------------------------------------
 
     def _index(self, chunks: List[Any]) -> VectorStoreIndex:
-        """Build an in-memory FAISS vector index from a list of chunk nodes.
+        """Build a vector index from a list of chunk nodes with optional persistence.
+
+        If persist_dir was provided during initialization and an index exists,
+        it will be loaded. Otherwise, a new index is built.
 
         Args:
             chunks: List of :class:`~llama_index.core.schema.BaseNode` objects
@@ -285,10 +322,15 @@ class RAGPipeline:
 
         Returns:
             A :class:`~llama_index.core.VectorStoreIndex` backed by an
-            in-memory FAISS store.
+            in-memory FAISS store, optionally persisted to disk.
         """
         vector_index = VectorStoreIndex.from_documents(chunks)
         logger.info("Indexed %d chunks.", len(chunks))
+        
+        if self.persist_dir:
+            vector_index.storage_context.persist(persist_dir=self.persist_dir)
+            logger.info("Index persisted to %s", self.persist_dir)
+        
         return vector_index
 
     # ------------------------------------------------------------------
@@ -390,6 +432,8 @@ class RAGPipeline:
     def _annotate_pharma_doc_types(self, documents: List[Document]) -> List[Document]:
         """Add a ``pharma_doc_type`` metadata field to each document via LLM classification.
 
+        Processes documents in batches to reduce overhead from multiple LLM calls.
+
         Args:
             documents: Pages loaded by :meth:`load_pdf`.
 
@@ -397,10 +441,42 @@ class RAGPipeline:
             The same list with ``pharma_doc_type`` set on every document's metadata.
         """
         logger.info("Classifying %d pages into pharma doc types...", len(documents))
-        for i, doc in enumerate(documents):
-            doc_type = self._classify_document(doc.text)
-            doc.metadata["pharma_doc_type"] = doc_type
-            logger.debug("Page %d → %s", doc.metadata.get("page_number", i + 1), doc_type)
+        
+        # Batch classification: group 5 pages per LLM call for efficiency
+        batch_size = 5
+        for batch_start in range(0, len(documents), batch_size):
+            batch_end = min(batch_start + batch_size, len(documents))
+            batch = documents[batch_start:batch_end]
+            
+            # Build combined prompt for batch
+            categories_str = ", ".join(_PHARMA_DOC_CATEGORIES)
+            batch_texts = []
+            for idx, doc in enumerate(batch):
+                page_num = doc.metadata.get("page_number", batch_start + idx + 1)
+                batch_texts.append(f"Page {page_num}:\n{doc.text[:400]}\n")
+            
+            combined_text = "\n---\n".join(batch_texts)
+            prompt = (
+                "You are an expert pharmaceutical document classifier.\n"
+                "For each page below, identify its document type.\n"
+                f"Choose exactly one from: {categories_str}.\n"
+                "Respond with one category per line (just the category name in snake_case).\n\n"
+                f"{combined_text}\n"
+                "Categories (one per line):"
+            )
+            
+            response = self.llm.complete(prompt)
+            categories = [line.strip().lower() for line in response.text.split("\n") if line.strip()]
+            
+            # Assign classifications to documents
+            for idx, doc in enumerate(batch):
+                if idx < len(categories) and categories[idx] in _PHARMA_DOC_CATEGORIES:
+                    doc_type = categories[idx]
+                else:
+                    doc_type = "unknown"
+                doc.metadata["pharma_doc_type"] = doc_type
+                logger.debug("Page %d → %s", doc.metadata.get("page_number", batch_start + idx + 1), doc_type)
+        
         logger.info("Document classification complete.")
         return documents
 
@@ -470,6 +546,9 @@ class RAGPipeline:
         This method runs the full ingestion pipeline:
         load → (classify) → chunk → embed & index → build hybrid retriever → attach query engine.
 
+        If persist_dir was provided during initialization, the method will attempt
+        to load a previously saved index, skipping the indexing step.
+
         Call this once per document. Calling it again replaces the current index.
 
         Args:
@@ -477,16 +556,37 @@ class RAGPipeline:
             classify_docs: When ``True``, each page is classified by the LLM and
                 its ``pharma_doc_type`` is stored in chunk metadata.  This enables
                 targeted retrieval via the ``classify`` parameter on :meth:`query`
-                and :meth:`query_with_sources`.  Adds one LLM call per page, so
-                it is ``False`` by default.
+                and :meth:`query_with_sources`.  Uses batched classification to
+                reduce LLM calls.
         """
         self._pdf_path = pdf_path
-        documents = self.load_pdf(pdf_path)
-        if classify_docs:
-            documents = self._annotate_pharma_doc_types(documents)
-        self._docs_classified = classify_docs
-        self._chunks = self._chunk(documents)
-        self._vector_index = self._index(self._chunks)
+        
+        # Try to load existing index if persistence is enabled
+        if self.persist_dir and os.path.exists(self.persist_dir):
+            try:
+                logger.info("Loading persisted index from %s...", self.persist_dir)
+                storage_context = StorageContext.from_defaults(persist_dir=self.persist_dir)
+                self._vector_index = load_index_from_storage(storage_context)
+                # Load chunks from index
+                self._chunks = list(self._vector_index.docstore.docs.values())
+                self._docs_classified = any(
+                    "pharma_doc_type" in getattr(chunk, "metadata", {})
+                    for chunk in self._chunks
+                )
+                logger.info("Loaded index with %d chunks.", len(self._chunks))
+            except Exception as e:
+                logger.warning("Failed to load persisted index: %s. Building new index.", e)
+                self._vector_index = None
+        
+        # Build new index if not loaded
+        if self._vector_index is None:
+            documents = self.load_pdf(pdf_path)
+            if classify_docs:
+                documents = self._annotate_pharma_doc_types(documents)
+            self._docs_classified = classify_docs
+            self._chunks = self._chunk(documents)
+            self._vector_index = self._index(self._chunks)
+        
         hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
 
         self._query_engine = RetrieverQueryEngine.from_args(
