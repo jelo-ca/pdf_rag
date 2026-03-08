@@ -161,6 +161,8 @@ You can override this at initialisation — see [Configuration](#configuration).
 
 ## Quick Start
 
+### Single File
+
 ```python
 from rag_pipeline import RAGPipeline
 
@@ -174,6 +176,41 @@ rag.build("path/to/document.pdf")
 answer = rag.query("What are the storage conditions?")
 print(answer)
 ```
+
+### Multiple Files
+
+The pipeline now supports indexing multiple PDF files simultaneously into a unified searchable index:
+
+```python
+from rag_pipeline import RAGPipeline
+
+rag = RAGPipeline()
+
+# Index multiple documents at once
+pdf_files = [
+    "certificate_of_analysis.pdf",
+    "material_specification.pdf",
+    "bse_tse_declaration.pdf"
+]
+
+# Optional: Track progress
+def show_progress(current, total, filename):
+    print(f"Loading {current}/{total}: {filename}")
+
+rag.build_from_multiple_pdfs(
+    pdf_files,
+    classify_docs=True,
+    progress_callback=show_progress
+)
+
+# Query across all indexed documents
+result = rag.query_with_sources("What is the BSE/TSE status?")
+print(result["answer"])
+for source in result["sources"]:
+    print(f"Source: {source['file']}, page {source['page']}")
+```
+
+See [MULTI_FILE_FEATURE.md](MULTI_FILE_FEATURE.md) for detailed documentation on multi-file upload functionality.
 
 ---
 
@@ -272,16 +309,16 @@ query as the first element, followed by up to `num_expansions` alternatives.
 The pipeline can classify both documents and queries into one of eight pharmaceutical
 document categories using the local LLM:
 
-| Category | Description |
-|---|---|
-| `cover_letter` | Accompanying cover letter |
-| `certificate_of_quality` | CoA / CoQ document |
-| `packaging_specification` | Packaging or labelling spec |
-| `bse_tse_declaration` | BSE/TSE risk declaration |
-| `material_description` | Raw material or ingredient description |
-| `supplier_qualification` | Vendor/supplier audit or approval |
-| `chain_of_custody` | Traceability or chain-of-custody record |
-| `unknown` | Could not be classified |
+| Category                  | Description                             |
+| ------------------------- | --------------------------------------- |
+| `cover_letter`            | Accompanying cover letter               |
+| `certificate_of_quality`  | CoA / CoQ document                      |
+| `packaging_specification` | Packaging or labelling spec             |
+| `bse_tse_declaration`     | BSE/TSE risk declaration                |
+| `material_description`    | Raw material or ingredient description  |
+| `supplier_qualification`  | Vendor/supplier audit or approval       |
+| `chain_of_custody`        | Traceability or chain-of-custody record |
+| `unknown`                 | Could not be classified                 |
 
 ### Document classification (at build time)
 
@@ -329,14 +366,17 @@ All parameters are set at initialisation:
 Open `rag.ipynb` in Jupyter and run all cells. A Gradio interface will launch at
 `http://localhost:7860` with:
 
-- **Upload panel** — drag-and-drop a PDF, then click **Build Pipeline**
+- **Upload panel** — drag-and-drop one or more PDFs (supports multiple file uploads), then click **Build Pipeline**
   - **Classify document pages** checkbox — when enabled, each page is classified
     by the LLM into a pharma document category before indexing (`classify_docs=True`)
-- **Chat** — type questions and receive answers with source citations
+  - Multiple files are processed sequentially and indexed into a unified searchable collection
+  - Progress updates show which files have been loaded
+- **Chat** — type questions and receive answers with source citations from all indexed documents
   - **Classify query** checkbox — when enabled, the query is classified and retrieval
     is restricted to matching document-type chunks (`classify=True`)
-- **Sources panel** — per-chunk confidence scores, page references, and pharma
+- **Sources panel** — per-chunk confidence scores, page references, source file names, and pharma
   document type labels; shows the detected query category when classification is active
+- **Stats panel** — displays total files indexed, pages, chunks, and document type distribution
 
 ---
 

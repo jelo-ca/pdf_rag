@@ -672,14 +672,81 @@ class RAGPipeline:
         )
         logger.info("RAG pipeline ready.")
 
+    def build_from_multiple_pdfs(
+        self,
+        pdf_paths: List[str],
+        classify_docs: bool = False,
+        progress_callback: Optional[callable] = None,
+    ) -> None:
+        """Index multiple PDF documents into a single unified index.
+
+        This method processes multiple PDFs sequentially, loading and combining
+        all pages before chunking and indexing. This creates a single searchable
+        index across all documents.
+
+        Args:
+            pdf_paths: List of paths to PDF files to ingest.
+            classify_docs: When ``True``, each page is classified by the LLM and
+                its ``pharma_doc_type`` is stored in chunk metadata.
+            progress_callback: Optional callback function called after each PDF
+                is loaded. Receives (current_index, total_count, filename).
+
+        Raises:
+            ValueError: If pdf_paths is empty.
+        """
+        if not pdf_paths:
+            raise ValueError("No PDF paths provided.")
+
+        # Clear persistence dir since we're building from multiple sources
+        if self.persist_dir and os.path.exists(self.persist_dir):
+            logger.info("Clearing persisted index for multi-document build...")
+            import shutil
+            shutil.rmtree(self.persist_dir)
+
+        all_documents: List[Document] = []
+        
+        for idx, pdf_path in enumerate(pdf_paths, 1):
+            logger.info("Loading PDF %d/%d: %s", idx, len(pdf_paths), pdf_path)
+            documents = self.load_pdf(pdf_path)
+            all_documents.extend(documents)
+            
+            if progress_callback:
+                progress_callback(idx, len(pdf_paths), os.path.basename(pdf_path))
+
+        logger.info("Loaded %d total pages from %d PDFs.", len(all_documents), len(pdf_paths))
+
+        # Classify all documents together if requested
+        if classify_docs:
+            all_documents = self._annotate_pharma_doc_types(all_documents)
+        self._docs_classified = classify_docs
+
+        # Chunk and index all documents
+        self._chunks = self._chunk(all_documents)
+        self._vector_index = self._index(self._chunks)
+
+        # Build retriever and query engine
+        hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
+        self._query_engine = RetrieverQueryEngine.from_args(
+            retriever=hybrid_retriever,
+            llm=self.llm,
+            text_qa_template=_PHARMA_QA_PROMPT,
+        )
+        
+        # Store list of PDF paths for stats
+        self._pdf_path = f"Multiple files ({len(pdf_paths)} PDFs)"
+        
+        logger.info("RAG pipeline ready with %d documents.", len(pdf_paths))
+
     def get_stats(self) -> Dict[str, Any]:
-        """Return statistics about the currently indexed document.
+        """Return statistics about the currently indexed document(s).
 
         Returns:
             A dictionary with the following keys:
 
-            - ``total_pages`` (*int*) – Total page count of the indexed PDF.
+            - ``total_pages`` (*int*) – Total page count across all indexed PDFs.
             - ``total_chunks`` (*int*) – Number of chunks in the index.
+            - ``total_files`` (*int*) – Number of unique files indexed.
+            - ``file_names`` (*list*) – List of unique source filenames.
             - ``doc_type_counts`` (*dict*) – Mapping of ``pharma_doc_type`` →
               chunk count. Only populated when the index was built with
               ``classify_docs=True``; otherwise contains ``{"unclassified": N}``.
@@ -691,23 +758,36 @@ class RAGPipeline:
         if not self._chunks:
             raise RuntimeError("Pipeline not built. Call build(pdf_path) first.")
 
-        total_pages: int = self._chunks[0].metadata.get("total_pages", 0)
-
-        # Deduplicate by page so each page is counted once per type
-        page_types: Dict[int, str] = {}
+        # Collect unique file names and total pages
+        file_names = set()
+        total_pages = 0
         for chunk in self._chunks:
+            file_name = chunk.metadata.get("file_name")
+            if file_name:
+                file_names.add(file_name)
+            # Track max page number per file for accurate total
+            page_num = chunk.metadata.get("page_number", 0)
+            if page_num > total_pages:
+                total_pages = page_num
+
+        # Deduplicate by (file, page) so each page is counted once per type
+        page_types: Dict[tuple, str] = {}
+        for chunk in self._chunks:
+            file_name = chunk.metadata.get("file_name")
             page = chunk.metadata.get("page_number")
             dt = chunk.metadata.get("pharma_doc_type", "unclassified")
-            if page is not None:
-                page_types[page] = dt
+            if file_name is not None and page is not None:
+                page_types[(file_name, page)] = dt
 
         doc_type_counts: Dict[str, int] = {}
         for dt in page_types.values():
             doc_type_counts[dt] = doc_type_counts.get(dt, 0) + 1
 
         return {
-            "total_pages": total_pages,
+            "total_pages": len(page_types),  # Total unique pages across all files
             "total_chunks": len(self._chunks),
+            "total_files": len(file_names),
+            "file_names": sorted(list(file_names)),
             "doc_type_counts": doc_type_counts,
             "classified": self._docs_classified,
         }
