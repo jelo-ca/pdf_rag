@@ -18,9 +18,17 @@ PDF Input
 │  Output: List[Document] + metadata  │
 └──────────────┬──────────────────────┘
                │
+               ▼  (optional — classify_docs=True)
+┌─────────────────────────────────────┐
+│  2. CLASSIFY  (_annotate_pharma_doc_types) │
+│  LLM classifies each page into one  │
+│  of 8 pharma doc categories         │
+│  Stored in pharma_doc_type metadata │
+└──────────────┬──────────────────────┘
+               │
                ▼
 ┌─────────────────────────────────────┐
-│  2. CHUNK  (_chunk)                 │
+│  3. CHUNK  (_chunk)                 │
 │  SemanticSplitterNodeParser         │
 │  Splits by embedding similarity,    │
 │  not fixed token count              │
@@ -28,28 +36,31 @@ PDF Input
                │
                ▼
 ┌─────────────────────────────────────┐
-│  3. INDEX  (_index)                 │
+│  4. INDEX  (_index)                 │
 │  HuggingFace embeddings             │
 │  FAISS in-memory vector store       │
 └──────────────┬──────────────────────┘
                │
                ▼
 ┌─────────────────────────────────────────────────────┐
-│  4. RETRIEVE  (_build_retriever)                    │
+│  5. RETRIEVE  (_build_retriever)                    │
 │                                                     │
-│  ┌──────────────────┐   ┌──────────────────┐       │
-│  │  Vector Search   │   │  BM25 Search     │       │
-│  │  (FAISS / dense) │   │  (keyword/sparse)│       │
-│  └────────┬─────────┘   └────────┬─────────┘       │
-│           └──────────┬───────────┘                 │
+│  ┌──────────────────┐   ┌──────────────────┐        │
+│  │  Vector Search   │   │  BM25 Search     │        │
+│  │  (FAISS / dense) │   │  (keyword/sparse)│        │
+│  └────────┬─────────┘   └────────┬─────────┘        │
+│           └──────────┬───────────┘                  │
 │                      ▼                              │
 │           Reciprocal Rank Fusion                    │
 │           (normalised re-ranking)                   │
+│                                                     │
+│  (optional — classify=True)                         │
+│  Query classified → filter chunks by pharma type    │
 └──────────────┬──────────────────────────────────────┘
                │
                ▼
 ┌─────────────────────────────────────┐
-│  5. ANSWER  (query / query_with_sources)│
+│  6. ANSWER  (query / query_with_sources)│
 │  Retrieved chunks → prompt          │
 │  Local Mistral 7B GGUF (llama.cpp)  │
 │  Output: answer + citations         │
@@ -60,14 +71,14 @@ PDF Input
 
 ## Stack
 
-| Component | Details |
-|---|---|
-| **LLM** | Mistral 7B Instruct — local GGUF via `llama-cpp-python` |
-| **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` (HuggingFace) |
-| **Chunking** | Semantic — LlamaIndex `SemanticSplitterNodeParser` |
-| **Retrieval** | Hybrid: FAISS vector + BM25, fused via reciprocal rerank |
-| **OCR** | Tesseract — automatic fallback for scanned/image-based pages |
-| **UI** | Gradio |
+| Component      | Details                                                      |
+| -------------- | ------------------------------------------------------------ |
+| **LLM**        | Mistral 7B Instruct — local GGUF via `llama-cpp-python`      |
+| **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` (HuggingFace)       |
+| **Chunking**   | Semantic — LlamaIndex `SemanticSplitterNodeParser`           |
+| **Retrieval**  | Hybrid: FAISS vector + BM25, fused via reciprocal rerank     |
+| **OCR**        | Tesseract — automatic fallback for scanned/image-based pages |
+| **UI**         | Gradio                                                       |
 
 ---
 
@@ -182,35 +193,45 @@ class RAGPipeline:
     ) -> None
 ```
 
-#### `build(pdf_path)`
+#### `build(pdf_path, classify_docs)`
 
 ```python
-rag.build(pdf_path: str) -> None
+rag.build(pdf_path: str, classify_docs: bool = False) -> None
 ```
 
-Runs the full ingestion pipeline on a PDF: load → chunk → embed → index → build retriever.
+Runs the full ingestion pipeline on a PDF: load → (classify) → chunk → embed → index → build retriever.
 Call once per document. Calling again replaces the current index.
 
-#### `query(question, expand, num_expansions)`
+When `classify_docs=True`, each page is passed to the LLM and labelled with one of
+eight pharmaceutical document categories (see [Classification](#classification)).
+This label is stored in the `pharma_doc_type` chunk metadata field and enables
+targeted retrieval when querying with `classify=True`. Adds one LLM call per page.
+
+#### `query(question, expand, num_expansions, classify)`
 
 ```python
 rag.query(
     question: str,
     expand: bool = False,
     num_expansions: int = 3,
+    classify: bool = False,
 ) -> str
 ```
 
 Returns a plain-text answer with inline citations. Set `expand=True` to enable
 LLM-based query expansion before retrieval (improves recall, increases latency).
+Set `classify=True` to classify the query into a pharma document category and
+restrict retrieval to matching chunks (requires `classify_docs=True` at build time
+for chunk filtering; classification still runs otherwise).
 
-#### `query_with_sources(question, expand, num_expansions)`
+#### `query_with_sources(question, expand, num_expansions, classify)`
 
 ```python
 rag.query_with_sources(
     question: str,
     expand: bool = False,
     num_expansions: int = 3,
+    classify: bool = False,
 ) -> dict
 ```
 
@@ -221,15 +242,17 @@ Returns a structured result:
     "answer": str,           # LLM answer with inline citations
     "sources": [             # Retrieved chunks
         {
-            "text":     str,   # Full chunk text
-            "file":     str,   # Source filename
-            "page":     int,   # 1-based page number
-            "score":    float, # Confidence % relative to top chunk (0–100)
-            "doc_type": str,   # "digital" or "scanned"
+            "text":           str,   # Full chunk text
+            "file":           str,   # Source filename
+            "page":           int,   # 1-based page number
+            "score":          float, # Confidence % relative to top chunk (0–100)
+            "doc_type":       str,   # "digital" or "scanned"
+            "pharma_doc_type": str,  # Pharma category label ("unknown" if not classified)
         },
         ...
     ],
-    "chunk_count": int,      # Number of chunks retrieved
+    "chunk_count":    int,        # Number of chunks retrieved
+    "query_category": str | None, # Detected pharma category, or None if classify=False
 }
 ```
 
@@ -244,17 +267,60 @@ query as the first element, followed by up to `num_expansions` alternatives.
 
 ---
 
+## Classification
+
+The pipeline can classify both documents and queries into one of eight pharmaceutical
+document categories using the local LLM:
+
+| Category | Description |
+|---|---|
+| `cover_letter` | Accompanying cover letter |
+| `certificate_of_quality` | CoA / CoQ document |
+| `packaging_specification` | Packaging or labelling spec |
+| `bse_tse_declaration` | BSE/TSE risk declaration |
+| `material_description` | Raw material or ingredient description |
+| `supplier_qualification` | Vendor/supplier audit or approval |
+| `chain_of_custody` | Traceability or chain-of-custody record |
+| `unknown` | Could not be classified |
+
+### Document classification (at build time)
+
+```python
+rag.build("document.pdf", classify_docs=True)
+```
+
+Each page is sent to the LLM and labelled. The label is stored in the
+`pharma_doc_type` metadata field on every chunk derived from that page.
+
+### Query classification (at query time)
+
+```python
+answer = rag.query("What are the storage conditions?", classify=True)
+result = rag.query_with_sources("Who is the supplier?", classify=True)
+```
+
+The query is classified into a pharma category. If the index was built with
+`classify_docs=True`, retrieval is filtered to chunks whose `pharma_doc_type`
+matches the detected category. The detected category is returned as
+`result["query_category"]` in `query_with_sources`.
+
+> **Note:** Query classification works even without `classify_docs=True` — the LLM
+> still classifies the query, but no chunk filtering is applied because the metadata
+> is not present.
+
+---
+
 ## Configuration
 
 All parameters are set at initialisation:
 
-| Parameter | Default | Description |
-|---|---|---|
-| `model_path` | — | **Required.** Path to the local GGUF model file. |
-| `embed_model_name` | `all-MiniLM-L6-v2` | HuggingFace embedding model. |
-| `similarity_top_k` | `5` | Chunks returned per retriever before fusion. |
-| `num_queries` | `1` | Query variants for `QueryFusionRetriever`. Set `>1` to enable internal expansion. |
-| `n_gpu_layers` | `-1` | GPU layers offloaded. `-1` = all (CUDA). `0` = CPU only. |
+| Parameter          | Default            | Description                                                                       |
+| ------------------ | ------------------ | --------------------------------------------------------------------------------- |
+| `model_path`       | —                  | **Required.** Path to the local GGUF model file.                                  |
+| `embed_model_name` | `all-MiniLM-L6-v2` | HuggingFace embedding model.                                                      |
+| `similarity_top_k` | `5`                | Chunks returned per retriever before fusion.                                      |
+| `num_queries`      | `1`                | Query variants for `QueryFusionRetriever`. Set `>1` to enable internal expansion. |
+| `n_gpu_layers`     | `-1`               | GPU layers offloaded. `-1` = all (CUDA). `0` = CPU only.                          |
 
 ---
 
@@ -264,8 +330,13 @@ Open `rag.ipynb` in Jupyter and run all cells. A Gradio interface will launch at
 `http://localhost:7860` with:
 
 - **Upload panel** — drag-and-drop a PDF, then click **Build Pipeline**
+  - **Classify document pages** checkbox — when enabled, each page is classified
+    by the LLM into a pharma document category before indexing (`classify_docs=True`)
 - **Chat** — type questions and receive answers with source citations
-- **Sources panel** — per-chunk confidence scores and page references
+  - **Classify query** checkbox — when enabled, the query is classified and retrieval
+    is restricted to matching document-type chunks (`classify=True`)
+- **Sources panel** — per-chunk confidence scores, page references, and pharma
+  document type labels; shows the detected query category when classification is active
 
 ---
 
@@ -288,10 +359,12 @@ the GGUF file has been downloaded.
 
 **`ImportError: No module named 'pytesseract'` / OCR not available**
 OCR is optional. Install it to enable scanned-page support:
+
 ```bash
 pip install pytesseract pillow
 # Also install Tesseract binary: https://github.com/tesseract-ocr/tesseract
 ```
+
 Without it, scanned pages are silently skipped.
 
 **CUDA out of memory**
