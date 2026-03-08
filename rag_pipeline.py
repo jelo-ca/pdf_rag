@@ -22,7 +22,7 @@ import fitz  # PyMuPDF
 import torch
 from dotenv import load_dotenv
 from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex, load_index_from_storage
-from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.node_parser import SemanticSplitterNodeParser
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import QueryFusionRetriever, VectorIndexRetriever
@@ -69,6 +69,57 @@ _PHARMA_DOC_CATEGORIES: List[str] = [
     "chain_of_custody",
     "unknown",
 ]
+
+# Keyword signals for fast pre-classification before any LLM call.
+# Keys must be valid entries in _PHARMA_DOC_CATEGORIES.
+_KEYWORD_MAP: Dict[str, List[str]] = {
+    "cover_letter": [
+        "cover letter", "dear sir", "dear madam", "dear supplier",
+        "please find enclosed", "we herewith", "herewith enclosed",
+    ],
+    "certificate_of_quality": [
+        "certificate of quality", "certificate of analysis",
+        "cert. of quality", "coa ", "c.o.a",
+    ],
+    "packaging_specification": [
+        "packaging specification", "packaging spec", "pack spec",
+        "label specification", "labelling specification",
+    ],
+    "bse_tse_declaration": [
+        "bse", "tse", "transmissible spongiform", "bovine spongiform",
+        "spongiform encephalopathy",
+    ],
+    "material_description": [
+        "material description", "material data sheet", "product description",
+        "substance description", "raw material description",
+    ],
+    "supplier_qualification": [
+        "supplier qualification", "vendor qualification",
+        "approved supplier", "audit report", "supplier audit",
+    ],
+    "chain_of_custody": [
+        "chain of custody", "chain-of-custody", "custody transfer",
+    ],
+}
+
+# One labelled example per category shown to the LLM when keyword matching
+# fails.  Short excerpts are enough — the goal is to anchor the format.
+_FEW_SHOT_EXAMPLES: str = (
+    "cover_letter\n"
+    "Example: \"Dear Supplier, Please find enclosed the updated documentation for batch 2024-001.\"\n\n"
+    "certificate_of_quality\n"
+    "Example: \"Certificate of Quality — Batch No: 12345 — Product: Excipient X — Conforms to specification.\"\n\n"
+    "packaging_specification\n"
+    "Example: \"Packaging Specification Rev. 3 — Primary container: HDPE bottle 250 mL — Closure torque: 15–20 Nm.\"\n\n"
+    "bse_tse_declaration\n"
+    "Example: \"BSE/TSE Declaration — We confirm that no materials of bovine or ovine origin are used.\"\n\n"
+    "material_description\n"
+    "Example: \"Material Description — Chemical name: Microcrystalline Cellulose — CAS: 9004-34-6 — Function: Filler.\"\n\n"
+    "supplier_qualification\n"
+    "Example: \"Supplier Qualification Report — Audit date: 2023-05 — Site: Plant A — Status: Approved.\"\n\n"
+    "chain_of_custody\n"
+    "Example: \"Chain of Custody — Transferred from Manufacturer X to Distributor Y on 2024-03-01.\"\n\n"
+)
 
 # DPI used when rasterising a PDF page for OCR. 200 dpi gives a good
 # balance between OCR accuracy, memory usage, and speed.
@@ -166,9 +217,8 @@ class RAGPipeline:
         Settings.embed_model = self.embed_model
         Settings.llm = self.llm
 
-        self._splitter: SentenceSplitter = SentenceSplitter(
-            chunk_size=512,
-            chunk_overlap=50
+        self._splitter: SemanticSplitterNodeParser = SemanticSplitterNodeParser(
+            embed_model=self.embed_model,
         )
 
         self.persist_dir: Optional[str] = persist_dir
@@ -284,9 +334,9 @@ class RAGPipeline:
     def _chunk(self, documents: List[Document]) -> List[Any]:
         """Split documents into fixed-size chunks with overlap.
 
-        Uses :class:`~llama_index.core.node_parser.SentenceSplitter`
-        which splits text into chunks of approximately 512 tokens with
-        50 token overlap for context preservation.
+        Uses :class:`~llama_index.core.node_parser.SemanticSplitterNodeParser`
+        which groups sentences into chunks based on embedding similarity,
+        so chunk boundaries align with semantic topic shifts.
 
         Args:
             documents: List of :class:`~llama_index.core.Document` objects
@@ -301,7 +351,7 @@ class RAGPipeline:
         """
         if not documents:
             raise ValueError("No documents provided for chunking.")
-        logger.info("Performing fixed-size chunking...")
+        logger.info("Performing semantic chunking...")
         chunks = self._splitter.get_nodes_from_documents(documents)
         logger.info("Total chunks created: %d", len(chunks))
         return chunks
@@ -379,6 +429,29 @@ class RAGPipeline:
     # Document & Query Classification
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _parse_category(response_text: str) -> str:
+        """Extract the first valid pharma category from an LLM response string.
+
+        Scans every whitespace-separated token (after stripping punctuation) for
+        a match against :data:`_PHARMA_DOC_CATEGORIES`.  This is intentionally
+        more permissive than a last-word check so that responses like
+        ``"The type is cover_letter."`` or ``"certificate_of_quality\\n\\nThis…"``
+        are still parsed correctly.
+
+        Args:
+            response_text: Raw text returned by the LLM.
+
+        Returns:
+            The first matching category string, or ``"unknown"`` if none found.
+        """
+        normalised = response_text.strip().lower()
+        # Fast path: check for each category as a substring in declaration order
+        for cat in _PHARMA_DOC_CATEGORIES:
+            if cat != "unknown" and cat in normalised:
+                return cat
+        return "unknown"
+
     def _classify_query(self, query: str) -> str:
         """Classify a natural-language query into a pharma document category.
 
@@ -402,13 +475,20 @@ class RAGPipeline:
             "Category:"
         )
         response = self.llm.complete(prompt)
-        raw = response.text.strip().split()[-1].strip().lower() if response.text.strip() else ""
-        result = raw if raw in _PHARMA_DOC_CATEGORIES else "unknown"
+        result = self._parse_category(response.text)
         logger.info("Query classified as: %s", result)
         return result
 
     def _classify_document(self, text: str) -> str:
         """Classify a page of document text into a pharma document category.
+
+        Uses a two-stage approach for efficiency:
+
+        1. **Keyword scan** — checks the first 300 characters of the page
+           against :data:`_KEYWORD_MAP`.  Returns immediately on a match
+           (no LLM call).
+        2. **Few-shot LLM** — if no keyword matched, asks the LLM with one
+           labelled example per category to anchor the output format.
 
         Args:
             text: Raw text extracted from a single PDF page.
@@ -416,23 +496,33 @@ class RAGPipeline:
         Returns:
             A snake_case category string from :data:`_PHARMA_DOC_CATEGORIES`.
         """
+        # Stage 1: keyword scan on the page header (fast, no LLM)
+        header = text[:300].lower()
+        for cat, keywords in _KEYWORD_MAP.items():
+            if any(kw in header for kw in keywords):
+                return cat
+
+        # Stage 2: few-shot LLM classification for ambiguous pages
         categories_str = ", ".join(_PHARMA_DOC_CATEGORIES)
         prompt = (
             "You are an expert pharmaceutical document classifier.\n"
-            "Given a page of text from a pharmaceutical document, identify its type.\n"
+            "Given a page of text, identify its document type.\n"
             f"Choose exactly one from: {categories_str}.\n"
             "Respond with only the category name in snake_case. No extra text.\n\n"
-            f"Document text:\n{text[:600]}\n\n"
+            "Examples:\n"
+            f"{_FEW_SHOT_EXAMPLES}"
+            f"Document text:\n{text[:800]}\n\n"
             "Category:"
         )
         response = self.llm.complete(prompt)
-        raw = response.text.strip().split()[-1].strip().lower() if response.text.strip() else ""
-        return raw if raw in _PHARMA_DOC_CATEGORIES else "unknown"
+        return self._parse_category(response.text)
 
     def _annotate_pharma_doc_types(self, documents: List[Document]) -> List[Document]:
         """Add a ``pharma_doc_type`` metadata field to each document via LLM classification.
 
-        Processes documents in batches to reduce overhead from multiple LLM calls.
+        Classifies each page individually so the LLM returns exactly one label
+        per call, avoiding the alignment errors that occur when parsing a
+        multi-label batch response.
 
         Args:
             documents: Pages loaded by :meth:`load_pdf`.
@@ -441,42 +531,12 @@ class RAGPipeline:
             The same list with ``pharma_doc_type`` set on every document's metadata.
         """
         logger.info("Classifying %d pages into pharma doc types...", len(documents))
-        
-        # Batch classification: group 5 pages per LLM call for efficiency
-        batch_size = 5
-        for batch_start in range(0, len(documents), batch_size):
-            batch_end = min(batch_start + batch_size, len(documents))
-            batch = documents[batch_start:batch_end]
-            
-            # Build combined prompt for batch
-            categories_str = ", ".join(_PHARMA_DOC_CATEGORIES)
-            batch_texts = []
-            for idx, doc in enumerate(batch):
-                page_num = doc.metadata.get("page_number", batch_start + idx + 1)
-                batch_texts.append(f"Page {page_num}:\n{doc.text[:400]}\n")
-            
-            combined_text = "\n---\n".join(batch_texts)
-            prompt = (
-                "You are an expert pharmaceutical document classifier.\n"
-                "For each page below, identify its document type.\n"
-                f"Choose exactly one from: {categories_str}.\n"
-                "Respond with one category per line (just the category name in snake_case).\n\n"
-                f"{combined_text}\n"
-                "Categories (one per line):"
+        for doc in documents:
+            doc_type = self._classify_document(doc.text)
+            doc.metadata["pharma_doc_type"] = doc_type
+            logger.debug(
+                "Page %d → %s", doc.metadata.get("page_number", "?"), doc_type
             )
-            
-            response = self.llm.complete(prompt)
-            categories = [line.strip().lower() for line in response.text.split("\n") if line.strip()]
-            
-            # Assign classifications to documents
-            for idx, doc in enumerate(batch):
-                if idx < len(categories) and categories[idx] in _PHARMA_DOC_CATEGORIES:
-                    doc_type = categories[idx]
-                else:
-                    doc_type = "unknown"
-                doc.metadata["pharma_doc_type"] = doc_type
-                logger.debug("Page %d → %s", doc.metadata.get("page_number", batch_start + idx + 1), doc_type)
-        
         logger.info("Document classification complete.")
         return documents
 
@@ -567,13 +627,21 @@ class RAGPipeline:
                 logger.info("Loading persisted index from %s...", self.persist_dir)
                 storage_context = StorageContext.from_defaults(persist_dir=self.persist_dir)
                 self._vector_index = load_index_from_storage(storage_context)
-                # Load chunks from index
                 self._chunks = list(self._vector_index.docstore.docs.values())
-                self._docs_classified = any(
+                loaded_classified = any(
                     "pharma_doc_type" in getattr(chunk, "metadata", {})
                     for chunk in self._chunks
                 )
-                logger.info("Loaded index with %d chunks.", len(self._chunks))
+                # If the caller wants classification but the persisted index was
+                # built without it, discard the cached index and rebuild.
+                if classify_docs and not loaded_classified:
+                    logger.info(
+                        "Persisted index lacks classification data. Rebuilding with classification."
+                    )
+                    self._vector_index = None
+                else:
+                    self._docs_classified = loaded_classified
+                    logger.info("Loaded index with %d chunks.", len(self._chunks))
             except Exception as e:
                 logger.warning("Failed to load persisted index: %s. Building new index.", e)
                 self._vector_index = None
@@ -595,6 +663,46 @@ class RAGPipeline:
             text_qa_template=_PHARMA_QA_PROMPT,
         )
         logger.info("RAG pipeline ready.")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return statistics about the currently indexed document.
+
+        Returns:
+            A dictionary with the following keys:
+
+            - ``total_pages`` (*int*) – Total page count of the indexed PDF.
+            - ``total_chunks`` (*int*) – Number of chunks in the index.
+            - ``doc_type_counts`` (*dict*) – Mapping of ``pharma_doc_type`` →
+              chunk count. Only populated when the index was built with
+              ``classify_docs=True``; otherwise contains ``{"unclassified": N}``.
+            - ``classified`` (*bool*) – Whether document classification was run.
+
+        Raises:
+            RuntimeError: If :meth:`build` has not been called yet.
+        """
+        if not self._chunks:
+            raise RuntimeError("Pipeline not built. Call build(pdf_path) first.")
+
+        total_pages: int = self._chunks[0].metadata.get("total_pages", 0)
+
+        # Deduplicate by page so each page is counted once per type
+        page_types: Dict[int, str] = {}
+        for chunk in self._chunks:
+            page = chunk.metadata.get("page_number")
+            dt = chunk.metadata.get("pharma_doc_type", "unclassified")
+            if page is not None:
+                page_types[page] = dt
+
+        doc_type_counts: Dict[str, int] = {}
+        for dt in page_types.values():
+            doc_type_counts[dt] = doc_type_counts.get(dt, 0) + 1
+
+        return {
+            "total_pages": total_pages,
+            "total_chunks": len(self._chunks),
+            "doc_type_counts": doc_type_counts,
+            "classified": self._docs_classified,
+        }
 
     def expand_query(self, query: str, num_expansions: int = 3) -> List[str]:
         """Generate alternative phrasings of a query using the LLM.
