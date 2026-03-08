@@ -15,6 +15,7 @@ LLM             : Mistral GGUF (local, via llama-cpp-python)
 
 import logging
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +35,7 @@ from llama_index.retrievers.bm25 import BM25Retriever
 try:
     import pytesseract
     from PIL import Image as PILImage
+
     _OCR_AVAILABLE = True
 except ImportError:
     _OCR_AVAILABLE = False
@@ -74,31 +76,53 @@ _PHARMA_DOC_CATEGORIES: List[str] = [
 # Keys must be valid entries in _PHARMA_DOC_CATEGORIES.
 _KEYWORD_MAP: Dict[str, List[str]] = {
     "cover_letter": [
-        "cover letter", "dear sir", "dear madam", "dear supplier",
-        "please find enclosed", "we herewith", "herewith enclosed",
+        "cover letter",
+        "dear sir",
+        "dear madam",
+        "dear supplier",
+        "please find enclosed",
+        "we herewith",
+        "herewith enclosed",
     ],
     "certificate_of_quality": [
-        "certificate of quality", "certificate of analysis",
-        "cert. of quality", "coa ", "c.o.a",
+        "certificate of quality",
+        "certificate of analysis",
+        "cert. of quality",
+        "coa ",
+        "c.o.a",
     ],
     "packaging_specification": [
-        "packaging specification", "packaging spec", "pack spec",
-        "label specification", "labelling specification",
+        "packaging specification",
+        "packaging spec",
+        "pack spec",
+        "label specification",
+        "labelling specification",
     ],
     "bse_tse_declaration": [
-        "bse", "tse", "transmissible spongiform", "bovine spongiform",
+        "bse",
+        "tse",
+        "transmissible spongiform",
+        "bovine spongiform",
         "spongiform encephalopathy",
     ],
     "material_description": [
-        "material description", "material data sheet", "product description",
-        "substance description", "raw material description",
+        "material description",
+        "material data sheet",
+        "product description",
+        "substance description",
+        "raw material description",
     ],
     "supplier_qualification": [
-        "supplier qualification", "vendor qualification",
-        "approved supplier", "audit report", "supplier audit",
+        "supplier qualification",
+        "vendor qualification",
+        "approved supplier",
+        "audit report",
+        "supplier audit",
     ],
     "chain_of_custody": [
-        "chain of custody", "chain-of-custody", "custody transfer",
+        "chain of custody",
+        "chain-of-custody",
+        "custody transfer",
     ],
 }
 
@@ -106,23 +130,23 @@ _KEYWORD_MAP: Dict[str, List[str]] = {
 # fails.  Short excerpts are enough — the goal is to anchor the format.
 _FEW_SHOT_EXAMPLES: str = (
     "cover_letter\n"
-    "Example: \"Dear Supplier, Please find enclosed the updated documentation "
-    "for batch 2024-001.\"\n\n"
+    'Example: "Dear Supplier, Please find enclosed the updated documentation '
+    'for batch 2024-001."\n\n'
     "certificate_of_quality\n"
-    "Example: \"Certificate of Quality — Batch No: 12345 — Product: "
-    "Excipient X — Conforms to specification.\"\n\n"
+    'Example: "Certificate of Quality — Batch No: 12345 — Product: '
+    'Excipient X — Conforms to specification."\n\n'
     "packaging_specification\n"
-    "Example: \"Packaging Specification Rev. 3 — Primary container: "
-    "HDPE bottle 250 mL — Closure torque: 15–20 Nm.\"\n\n"
+    'Example: "Packaging Specification Rev. 3 — Primary container: '
+    'HDPE bottle 250 mL — Closure torque: 15–20 Nm."\n\n'
     "bse_tse_declaration\n"
-    "Example: \"BSE/TSE Declaration — We confirm that no materials of bovine or ovine origin are used.\"\n\n"
+    'Example: "BSE/TSE Declaration — We confirm that no materials of bovine or ovine origin are used."\n\n'
     "material_description\n"
-    "Example: \"Material Description — Chemical name: Microcrystalline "
-    "Cellulose — CAS: 9004-34-6 — Function: Filler.\"\n\n"
+    'Example: "Material Description — Chemical name: Microcrystalline '
+    'Cellulose — CAS: 9004-34-6 — Function: Filler."\n\n'
     "supplier_qualification\n"
-    "Example: \"Supplier Qualification Report — Audit date: 2023-05 — Site: Plant A — Status: Approved.\"\n\n"
+    'Example: "Supplier Qualification Report — Audit date: 2023-05 — Site: Plant A — Status: Approved."\n\n'
     "chain_of_custody\n"
-    "Example: \"Chain of Custody — Transferred from Manufacturer X to Distributor Y on 2024-03-01.\"\n\n"
+    'Example: "Chain of Custody — Transferred from Manufacturer X to Distributor Y on 2024-03-01."\n\n'
 )
 
 # DPI used when rasterising a PDF page for OCR. 200 dpi gives a good
@@ -182,24 +206,11 @@ class RAGPipeline:
             ValueError: If no model path is provided and ``MODEL_PATH`` env var is unset.
         """
         _model_path: str = (
-            model_path
-            or os.getenv("MODEL_PATH")
-            or r"C:\LLM Models\Mistral\mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+            model_path or os.getenv("MODEL_PATH") or r"C:\LLM Models\Mistral\mistral-7b-instruct-v0.2.Q4_K_M.gguf"
         )
-        _embed_model: str = (
-            embed_model_name
-            or os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        )
-        _top_k: int = (
-            similarity_top_k
-            if similarity_top_k is not None
-            else int(os.getenv("SIMILARITY_TOP_K", "5"))
-        )
-        _gpu_layers: int = (
-            n_gpu_layers
-            if n_gpu_layers is not None
-            else int(os.getenv("N_GPU_LAYERS", "-1"))
-        )
+        _embed_model: str = embed_model_name or os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        _top_k: int = similarity_top_k if similarity_top_k is not None else int(os.getenv("SIMILARITY_TOP_K", "5"))
+        _gpu_layers: int = n_gpu_layers if n_gpu_layers is not None else int(os.getenv("N_GPU_LAYERS", "-1"))
 
         if not os.path.exists(_model_path):
             raise FileNotFoundError(f"GGUF model not found: {_model_path}")
@@ -291,16 +302,12 @@ class RAGPipeline:
             # Parallel OCR processing for scanned pages
             if _OCR_AVAILABLE:
                 pages_needing_ocr = [
-                    (i, page) for i, page, text in page_data
-                    if len(text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD
+                    (i, page) for i, page, text in page_data if len(text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD
                 ]
 
                 if pages_needing_ocr:
                     with ThreadPoolExecutor(max_workers=4) as executor:
-                        ocr_results = list(executor.map(
-                            lambda p: (p[0], self._ocr_page(p[1])),
-                            pages_needing_ocr
-                        ))
+                        ocr_results = list(executor.map(lambda p: (p[0], self._ocr_page(p[1])), pages_needing_ocr))
                     ocr_dict = dict(ocr_results)
                 else:
                     ocr_dict = {}
@@ -415,12 +422,8 @@ class RAGPipeline:
             A :class:`~llama_index.core.retrievers.QueryFusionRetriever`
             configured to return the top ``similarity_top_k`` fused results.
         """
-        vector_retriever = VectorIndexRetriever(
-            index=vector_index, similarity_top_k=self.similarity_top_k
-        )
-        bm25_retriever = BM25Retriever.from_defaults(
-            nodes=chunks, similarity_top_k=self.similarity_top_k
-        )
+        vector_retriever = VectorIndexRetriever(index=vector_index, similarity_top_k=self.similarity_top_k)
+        bm25_retriever = BM25Retriever.from_defaults(nodes=chunks, similarity_top_k=self.similarity_top_k)
         hybrid_retriever = QueryFusionRetriever(
             retrievers=[vector_retriever, bm25_retriever],
             similarity_top_k=self.similarity_top_k,
@@ -542,9 +545,7 @@ class RAGPipeline:
         for doc in documents:
             doc_type = self._classify_document(doc.text)
             doc.metadata["pharma_doc_type"] = doc_type
-            logger.debug(
-                "Page %d → %s", doc.metadata.get("page_number", "?"), doc_type
-            )
+            logger.debug("Page %d → %s", doc.metadata.get("page_number", "?"), doc_type)
         logger.info("Document classification complete.")
         return documents
 
@@ -568,19 +569,14 @@ class RAGPipeline:
         if self._vector_index is None:
             raise RuntimeError("Pipeline not built. Call build(pdf_path) first.")
 
-        filters = MetadataFilters(
-            filters=[MetadataFilter(key="pharma_doc_type", value=pharma_doc_type)]
-        )
+        filters = MetadataFilters(filters=[MetadataFilter(key="pharma_doc_type", value=pharma_doc_type)])
         vector_retriever = VectorIndexRetriever(
             index=self._vector_index,
             similarity_top_k=self.similarity_top_k,
             filters=filters,
         )
 
-        filtered_chunks = [
-            c for c in self._chunks
-            if c.metadata.get("pharma_doc_type") == pharma_doc_type
-        ]
+        filtered_chunks = [c for c in self._chunks if c.metadata.get("pharma_doc_type") == pharma_doc_type]
         if filtered_chunks:
             bm25_retriever = BM25Retriever.from_defaults(
                 nodes=filtered_chunks,
@@ -636,16 +632,11 @@ class RAGPipeline:
                 storage_context = StorageContext.from_defaults(persist_dir=self.persist_dir)
                 self._vector_index = load_index_from_storage(storage_context)
                 self._chunks = list(self._vector_index.docstore.docs.values())
-                loaded_classified = any(
-                    "pharma_doc_type" in getattr(chunk, "metadata", {})
-                    for chunk in self._chunks
-                )
+                loaded_classified = any("pharma_doc_type" in getattr(chunk, "metadata", {}) for chunk in self._chunks)
                 # If the caller wants classification but the persisted index was
                 # built without it, discard the cached index and rebuild.
                 if classify_docs and not loaded_classified:
-                    logger.info(
-                        "Persisted index lacks classification data. Rebuilding with classification."
-                    )
+                    logger.info("Persisted index lacks classification data. Rebuilding with classification.")
                     self._vector_index = None
                 else:
                     self._docs_classified = loaded_classified
@@ -700,16 +691,15 @@ class RAGPipeline:
         # Clear persistence dir since we're building from multiple sources
         if self.persist_dir and os.path.exists(self.persist_dir):
             logger.info("Clearing persisted index for multi-document build...")
-            import shutil
             shutil.rmtree(self.persist_dir)
 
         all_documents: List[Document] = []
-        
+
         for idx, pdf_path in enumerate(pdf_paths, 1):
             logger.info("Loading PDF %d/%d: %s", idx, len(pdf_paths), pdf_path)
             documents = self.load_pdf(pdf_path)
             all_documents.extend(documents)
-            
+
             if progress_callback:
                 progress_callback(idx, len(pdf_paths), os.path.basename(pdf_path))
 
@@ -731,10 +721,10 @@ class RAGPipeline:
             llm=self.llm,
             text_qa_template=_PHARMA_QA_PROMPT,
         )
-        
+
         # Store list of PDF paths for stats
         self._pdf_path = f"Multiple files ({len(pdf_paths)} PDFs)"
-        
+
         logger.info("RAG pipeline ready with %d documents.", len(pdf_paths))
 
     def get_stats(self) -> Dict[str, Any]:
@@ -767,8 +757,7 @@ class RAGPipeline:
                 file_names.add(file_name)
             # Track max page number per file for accurate total
             page_num = chunk.metadata.get("page_number", 0)
-            if page_num > total_pages:
-                total_pages = page_num
+            total_pages = max(total_pages, page_num)
 
         # Deduplicate by (file, page) so each page is counted once per type
         page_types: Dict[tuple, str] = {}
@@ -937,14 +926,16 @@ class RAGPipeline:
                 confidence = round((node.score / max_score) * 100, 1)
             else:
                 confidence = round(100.0 / (rank + 1), 1)
-            sources.append({
-                "text": node.node.text,
-                "file": meta.get("file_name", "unknown"),
-                "page": meta.get("page_number", "?"),
-                "score": confidence,
-                "doc_type": meta.get("doc_type", "digital"),
-                "pharma_doc_type": meta.get("pharma_doc_type", "unknown"),
-            })
+            sources.append(
+                {
+                    "text": node.node.text,
+                    "file": meta.get("file_name", "unknown"),
+                    "page": meta.get("page_number", "?"),
+                    "score": confidence,
+                    "doc_type": meta.get("doc_type", "digital"),
+                    "pharma_doc_type": meta.get("pharma_doc_type", "unknown"),
+                }
+            )
 
         return {
             "answer": str(response),

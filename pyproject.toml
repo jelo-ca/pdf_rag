@@ -1,3 +1,85 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-pipeline"
+version = "0.1.0"
+description = "A high-performance pharmaceutical document question-answering system"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "pymupdf",
+    "llama-index",
+    "llama-index-core",
+    "llama-index-embeddings-huggingface",
+    "llama-index-llms-llama-cpp",
+    "llama-index-retrievers-bm25",
+    "llama-cpp-python",
+    "sentence-transformers",
+    "huggingface-hub",
+    "torch",
+    "pytesseract",
+    "pillow",
+    "gradio>=6.9.0",
+    "nest-asyncio>=1.6.0",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "pylint>=2.17.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rag = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --strict-markers"
+
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 120
+known_third_party = [
+    "fitz",
+    "llama_index",
+    "llama_cpp",
+    "pytesseract",
+    "PIL",
+    "gradio",
+    "torch",
+    "sentence_transformers",
+]
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+src_paths = ["src", "tests"]
+
 [tool.pylint.master]
 jobs = 1
 
@@ -17,18 +99,3 @@ disable = [
 
 [tool.pylint.basic]
 good-names = ["i", "j", "k", "n", "e", "f", "v", "x", "y", "z", "_"]
-
-[tool.isort]
-profile = "black"
-line_length = 120
-known_third_party = [
-    "fitz",
-    "llama_index",
-    "llama_cpp",
-    "pytesseract",
-    "PIL",
-    "gradio",
-    "torch",
-    "sentence_transformers",
-]
-sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]

@@ -45,9 +45,18 @@ Thumbs.db
 docs/*.pdf
 storage/*.json
 
-# Pylint cache
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Linting
 .pylint.d/
 pylint-report.txt
+.ruff_cache/
 
-# MyPy cache
+# Type checking
 .mypy_cache/
+.pytype/
+.pyre/

@@ -5,6 +5,31 @@ Runs entirely on-device — no external API calls, no data leaves the machine.
 
 ---
 
+## Project Structure
+
+```
+RAG/
+├── src/
+│   └── rag/              # Main package
+│       ├── __init__.py   # Package exports
+│       ├── pipeline.py   # RAGPipeline implementation
+│       └── demos/        # Demo scripts
+│           └── multi_file.py
+├── tests/                # Test suite
+│   ├── conftest.py       # Test configuration
+│   └── test_rag_pipeline.py
+├── notebooks/            # Jupyter notebooks
+│   └── rag.ipynb         # Interactive demo
+├── docs/                 # Documentation
+├── storage/              # Persisted index data
+├── pyproject.toml        # Project configuration
+├── requirements.txt      # Production dependencies
+├── requirements-dev.txt  # Development dependencies
+└── README.md
+```
+
+---
+
 ## Architecture
 
 ```
@@ -97,23 +122,23 @@ PDF Input
 
 ```bash
 git clone <repo-url>
-cd local-rag
+cd RAG
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 ```
 
-### 2. Install dependencies
+### 2. Install the package
+
+The project uses a professional `src-layout` structure. Install in editable mode for development:
 
 ```bash
-pip install pymupdf \
-    llama-index llama-index-core \
-    llama-index-embeddings-huggingface \
-    llama-index-llms-llama-cpp \
-    llama-index-retrievers-bm25 \
-    llama-cpp-python \
-    sentence-transformers huggingface-hub torch \
-    pytesseract pillow \
-    "gradio>=6.9.0" nest-asyncio
+pip install -e .
+```
+
+Or install from requirements:
+
+```bash
+pip install -r requirements.txt
 ```
 
 **GPU build of `llama-cpp-python` (CUDA):**
@@ -128,7 +153,15 @@ CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --force-reinstall
 pip install llama-cpp-python
 ```
 
-### 3. Configure environment variables
+### 3. Install development dependencies (optional)
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+This includes pytest, black, isort, and pylint for testing and code quality.
+
+### 4. Configure environment variables
 
 ```bash
 cp .env.example .env
@@ -146,7 +179,7 @@ LOG_LEVEL=INFO
 
 All variables have sensible defaults — only `MODEL_PATH` is required if your model is not at the default path.
 
-### 4. Download a GGUF model
+### 5. Download a GGUF model
 
 Download `mistral-7b-instruct-v0.2.Q4_K_M.gguf` from HuggingFace and save it locally.
 The default path expected by the pipeline is:
@@ -164,7 +197,7 @@ You can override this at initialisation — see [Configuration](#configuration).
 ### Single File
 
 ```python
-from rag_pipeline import RAGPipeline
+from rag import RAGPipeline
 
 # MODEL_PATH (and other settings) are read from .env automatically.
 # Pass arguments explicitly to override any env var.
@@ -182,7 +215,7 @@ print(answer)
 The pipeline now supports indexing multiple PDF files simultaneously into a unified searchable index:
 
 ```python
-from rag_pipeline import RAGPipeline
+from rag import RAGPipeline
 
 rag = RAGPipeline()
 
@@ -209,8 +242,6 @@ print(result["answer"])
 for source in result["sources"]:
     print(f"Source: {source['file']}, page {source['page']}")
 ```
-
-See [MULTI_FILE_FEATURE.md](MULTI_FILE_FEATURE.md) for detailed documentation on multi-file upload functionality.
 
 ---
 
@@ -436,3 +467,4 @@ RAG/
 ├── .gitignore
 └── docs/                 # Sample documents
 ```
+

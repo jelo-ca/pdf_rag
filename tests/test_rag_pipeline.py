@@ -33,12 +33,12 @@ def fake_model_path(tmp_path):
 @pytest.fixture
 def pipeline(fake_model_path):
     """RAGPipeline with every heavy dependency patched out."""
-    from rag_pipeline import RAGPipeline
+    from rag import RAGPipeline
 
-    with patch("rag_pipeline.LlamaCPP") as mock_llm_cls, \
-         patch("rag_pipeline.HuggingFaceEmbedding") as mock_embed_cls, \
-         patch("rag_pipeline.SemanticSplitterNodeParser") as mock_splitter_cls, \
-         patch("rag_pipeline.Settings"):
+    with patch("rag.pipeline.LlamaCPP") as mock_llm_cls, \
+         patch("rag.pipeline.HuggingFaceEmbedding") as mock_embed_cls, \
+         patch("rag.pipeline.SemanticSplitterNodeParser") as mock_splitter_cls, \
+         patch("rag.pipeline.Settings"):
 
         mock_llm_cls.return_value = MagicMock(name="llm")
         mock_embed_cls.return_value = MagicMock(name="embed")
@@ -86,75 +86,75 @@ def _make_chunk(pharma_doc_type="certificate_of_quality"):
 
 class TestInit:
     def test_raises_file_not_found_for_missing_model(self):
-        from rag_pipeline import RAGPipeline
+        from rag import RAGPipeline
 
-        with patch("rag_pipeline.LlamaCPP"), \
-             patch("rag_pipeline.HuggingFaceEmbedding"), \
-             patch("rag_pipeline.SemanticSplitterNodeParser"), \
-             patch("rag_pipeline.Settings"):
+        with patch("rag.pipeline.LlamaCPP"), \
+             patch("rag.pipeline.HuggingFaceEmbedding"), \
+             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.Settings"):
             with pytest.raises(FileNotFoundError, match="GGUF model not found"):
                 RAGPipeline(model_path="/nonexistent/path/model.gguf")
 
     def test_uses_model_path_env_var(self, tmp_path, monkeypatch):
-        from rag_pipeline import RAGPipeline
+        from rag import RAGPipeline
 
         fake_model = tmp_path / "env_model.gguf"
         fake_model.write_bytes(b"")
         monkeypatch.setenv("MODEL_PATH", str(fake_model))
 
-        with patch("rag_pipeline.LlamaCPP") as mock_llm_cls, \
-             patch("rag_pipeline.HuggingFaceEmbedding"), \
-             patch("rag_pipeline.SemanticSplitterNodeParser"), \
-             patch("rag_pipeline.Settings"):
+        with patch("rag.pipeline.LlamaCPP") as mock_llm_cls, \
+             patch("rag.pipeline.HuggingFaceEmbedding"), \
+             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.Settings"):
             mock_llm_cls.return_value = MagicMock()
             RAGPipeline()  # no model_path arg
 
         assert mock_llm_cls.call_args.kwargs["model_path"] == str(fake_model)
 
     def test_default_similarity_top_k_is_5(self, fake_model_path, monkeypatch):
-        from rag_pipeline import RAGPipeline
+        from rag import RAGPipeline
 
         monkeypatch.delenv("SIMILARITY_TOP_K", raising=False)
 
-        with patch("rag_pipeline.LlamaCPP"), \
-             patch("rag_pipeline.HuggingFaceEmbedding"), \
-             patch("rag_pipeline.SemanticSplitterNodeParser"), \
-             patch("rag_pipeline.Settings"):
+        with patch("rag.pipeline.LlamaCPP"), \
+             patch("rag.pipeline.HuggingFaceEmbedding"), \
+             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path)
 
         assert rag.similarity_top_k == 5
 
     def test_custom_similarity_top_k(self, fake_model_path):
-        from rag_pipeline import RAGPipeline
+        from rag import RAGPipeline
 
-        with patch("rag_pipeline.LlamaCPP"), \
-             patch("rag_pipeline.HuggingFaceEmbedding"), \
-             patch("rag_pipeline.SemanticSplitterNodeParser"), \
-             patch("rag_pipeline.Settings"):
+        with patch("rag.pipeline.LlamaCPP"), \
+             patch("rag.pipeline.HuggingFaceEmbedding"), \
+             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path, similarity_top_k=10)
 
         assert rag.similarity_top_k == 10
 
     def test_similarity_top_k_from_env(self, fake_model_path, monkeypatch):
-        from rag_pipeline import RAGPipeline
+        from rag import RAGPipeline
 
         monkeypatch.setenv("SIMILARITY_TOP_K", "7")
-        with patch("rag_pipeline.LlamaCPP"), \
-             patch("rag_pipeline.HuggingFaceEmbedding"), \
-             patch("rag_pipeline.SemanticSplitterNodeParser"), \
-             patch("rag_pipeline.Settings"):
+        with patch("rag.pipeline.LlamaCPP"), \
+             patch("rag.pipeline.HuggingFaceEmbedding"), \
+             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path)
 
         assert rag.similarity_top_k == 7
 
     def test_similarity_top_k_arg_overrides_env(self, fake_model_path, monkeypatch):
-        from rag_pipeline import RAGPipeline
+        from rag import RAGPipeline
 
         monkeypatch.setenv("SIMILARITY_TOP_K", "99")
-        with patch("rag_pipeline.LlamaCPP"), \
-             patch("rag_pipeline.HuggingFaceEmbedding"), \
-             patch("rag_pipeline.SemanticSplitterNodeParser"), \
-             patch("rag_pipeline.Settings"):
+        with patch("rag.pipeline.LlamaCPP"), \
+             patch("rag.pipeline.HuggingFaceEmbedding"), \
+             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path, similarity_top_k=3)
 
         assert rag.similarity_top_k == 3
@@ -170,12 +170,12 @@ class TestInit:
         assert pipeline.num_queries == 1
 
     def test_custom_num_queries(self, fake_model_path):
-        from rag_pipeline import RAGPipeline
+        from rag import RAGPipeline
 
-        with patch("rag_pipeline.LlamaCPP"), \
-             patch("rag_pipeline.HuggingFaceEmbedding"), \
-             patch("rag_pipeline.SemanticSplitterNodeParser"), \
-             patch("rag_pipeline.Settings"):
+        with patch("rag.pipeline.LlamaCPP"), \
+             patch("rag.pipeline.HuggingFaceEmbedding"), \
+             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path, num_queries=4)
 
         assert rag.num_queries == 4
@@ -205,7 +205,7 @@ class TestLoadPdf:
         page = self._page("A" * 200)
         mock_doc = self._mock_doc([page])
 
-        with patch("rag_pipeline.fitz.open", return_value=mock_doc):
+        with patch("rag.pipeline.fitz.open", return_value=mock_doc):
             docs = pipeline.load_pdf(str(tmp_path / "doc.pdf"))
 
         assert len(docs) == 1
@@ -222,8 +222,8 @@ class TestLoadPdf:
         page = self._page("   \n  \t  ")
         mock_doc = self._mock_doc([page])
 
-        with patch("rag_pipeline.fitz.open", return_value=mock_doc), \
-             patch("rag_pipeline._OCR_AVAILABLE", False):
+        with patch("rag.pipeline.fitz.open", return_value=mock_doc), \
+             patch("rag.pipeline._OCR_AVAILABLE", False):
             docs = pipeline.load_pdf(str(tmp_path / "empty.pdf"))
 
         assert docs == []
@@ -234,8 +234,8 @@ class TestLoadPdf:
         mock_doc = self._mock_doc([sparse_page])
         ocr_text = "OCR extracted text " * 20
 
-        with patch("rag_pipeline.fitz.open", return_value=mock_doc), \
-             patch("rag_pipeline._OCR_AVAILABLE", True), \
+        with patch("rag.pipeline.fitz.open", return_value=mock_doc), \
+             patch("rag.pipeline._OCR_AVAILABLE", True), \
              patch.object(pipeline, "_ocr_page", return_value=ocr_text) as mock_ocr:
             docs = pipeline.load_pdf(str(tmp_path / "scan.pdf"))
 
@@ -249,8 +249,8 @@ class TestLoadPdf:
         sparse_page = self._page("hi")  # < 100 chars, but non-empty
         mock_doc = self._mock_doc([sparse_page])
 
-        with patch("rag_pipeline.fitz.open", return_value=mock_doc), \
-             patch("rag_pipeline._OCR_AVAILABLE", False), \
+        with patch("rag.pipeline.fitz.open", return_value=mock_doc), \
+             patch("rag.pipeline._OCR_AVAILABLE", False), \
              patch.object(pipeline, "_ocr_page") as mock_ocr:
             docs = pipeline.load_pdf(str(tmp_path / "scan.pdf"))
 
@@ -263,8 +263,8 @@ class TestLoadPdf:
         sparse_page = self._page("hi")
         mock_doc = self._mock_doc([sparse_page])
 
-        with patch("rag_pipeline.fitz.open", return_value=mock_doc), \
-             patch("rag_pipeline._OCR_AVAILABLE", True), \
+        with patch("rag.pipeline.fitz.open", return_value=mock_doc), \
+             patch("rag.pipeline._OCR_AVAILABLE", True), \
              patch.object(pipeline, "_ocr_page", return_value="   "):
             docs = pipeline.load_pdf(str(tmp_path / "blank_scan.pdf"))
 
@@ -274,8 +274,8 @@ class TestLoadPdf:
         pages = [self._page("A" * 200), self._page("B" * 200), self._page("   ")]
         mock_doc = self._mock_doc(pages, total=3)
 
-        with patch("rag_pipeline.fitz.open", return_value=mock_doc), \
-             patch("rag_pipeline._OCR_AVAILABLE", False):
+        with patch("rag.pipeline.fitz.open", return_value=mock_doc), \
+             patch("rag.pipeline._OCR_AVAILABLE", False):
             docs = pipeline.load_pdf(str(tmp_path / "multi.pdf"))
 
         assert len(docs) == 2
@@ -287,7 +287,7 @@ class TestLoadPdf:
         page = self._page("A" * 200)
         mock_doc = self._mock_doc([page])
 
-        with patch("rag_pipeline.fitz.open", return_value=mock_doc):
+        with patch("rag.pipeline.fitz.open", return_value=mock_doc):
             docs = pipeline.load_pdf(str(tmp_path / "report.pdf"))
 
         assert docs[0].metadata["source_id"] == "report.pdf:p1"
@@ -296,8 +296,8 @@ class TestLoadPdf:
         pages = [self._page(""), self._page("  "), self._page("\n")]
         mock_doc = self._mock_doc(pages)
 
-        with patch("rag_pipeline.fitz.open", return_value=mock_doc), \
-             patch("rag_pipeline._OCR_AVAILABLE", False):
+        with patch("rag.pipeline.fitz.open", return_value=mock_doc), \
+             patch("rag.pipeline._OCR_AVAILABLE", False):
             docs = pipeline.load_pdf(str(tmp_path / "allblank.pdf"))
 
         assert docs == []
@@ -579,7 +579,7 @@ class TestBuild:
              patch.object(pipeline, "_chunk", return_value=mock_chunks) as p_chunk, \
              patch.object(pipeline, "_index", return_value=mock_index) as p_index, \
              patch.object(pipeline, "_build_retriever", return_value=mock_retriever) as p_ret, \
-             patch("rag_pipeline.RetrieverQueryEngine") as mock_qe_cls:
+             patch("rag.pipeline.RetrieverQueryEngine") as mock_qe_cls:
             mock_qe_cls.from_args.return_value = mock_engine
             pipeline.build(fake_pdf)
 
@@ -610,7 +610,7 @@ class TestBuild:
              patch.object(pipeline, "_chunk", side_effect=lambda d: call_order.append("chunk") or [MagicMock()]), \
              patch.object(pipeline, "_index", side_effect=lambda c: call_order.append("index") or MagicMock()), \
              patch.object(pipeline, "_build_retriever", side_effect=lambda i, c: call_order.append("retrieve") or MagicMock()), \
-             patch("rag_pipeline.RetrieverQueryEngine"):
+             patch("rag.pipeline.RetrieverQueryEngine"):
             pipeline.build(fake_pdf)
 
         assert call_order == ["load", "chunk", "index", "retrieve"]
@@ -658,7 +658,7 @@ class TestBuildWithClassification:
              patch.object(pipeline, "_chunk", return_value=[MagicMock()]), \
              patch.object(pipeline, "_index", return_value=MagicMock()), \
              patch.object(pipeline, "_build_retriever", return_value=MagicMock()), \
-             patch("rag_pipeline.RetrieverQueryEngine"):
+             patch("rag.pipeline.RetrieverQueryEngine"):
             pipeline.build(fake_pdf)
         assert pipeline._docs_classified is False
 
@@ -669,7 +669,7 @@ class TestBuildWithClassification:
              patch.object(pipeline, "_chunk", return_value=[MagicMock()]), \
              patch.object(pipeline, "_index", return_value=MagicMock()), \
              patch.object(pipeline, "_build_retriever", return_value=MagicMock()), \
-             patch("rag_pipeline.RetrieverQueryEngine"):
+             patch("rag.pipeline.RetrieverQueryEngine"):
             pipeline.build(fake_pdf, classify_docs=True)
         assert pipeline._docs_classified is True
         mock_ann.assert_called_once()
@@ -681,7 +681,7 @@ class TestBuildWithClassification:
              patch.object(pipeline, "_chunk", return_value=[MagicMock()]), \
              patch.object(pipeline, "_index", return_value=MagicMock()), \
              patch.object(pipeline, "_build_retriever", return_value=MagicMock()), \
-             patch("rag_pipeline.RetrieverQueryEngine"):
+             patch("rag.pipeline.RetrieverQueryEngine"):
             pipeline.build(fake_pdf, classify_docs=False)
         mock_ann.assert_not_called()
 
@@ -694,7 +694,7 @@ class TestBuildWithClassification:
              patch.object(pipeline, "_chunk", return_value=[MagicMock()]) as mock_chunk, \
              patch.object(pipeline, "_index", return_value=MagicMock()), \
              patch.object(pipeline, "_build_retriever", return_value=MagicMock()), \
-             patch("rag_pipeline.RetrieverQueryEngine"):
+             patch("rag.pipeline.RetrieverQueryEngine"):
             pipeline.build(fake_pdf, classify_docs=True)
         mock_ann.assert_called_once_with(mock_docs)
         mock_chunk.assert_called_once_with(annotated)
@@ -707,7 +707,7 @@ class TestBuildWithClassification:
              patch.object(pipeline, "_chunk", side_effect=lambda d: call_order.append("chunk") or [MagicMock()]), \
              patch.object(pipeline, "_index", side_effect=lambda c: call_order.append("index") or MagicMock()), \
              patch.object(pipeline, "_build_retriever", side_effect=lambda i, c: call_order.append("retrieve") or MagicMock()), \
-             patch("rag_pipeline.RetrieverQueryEngine"):
+             patch("rag.pipeline.RetrieverQueryEngine"):
             pipeline.build(fake_pdf, classify_docs=True)
         assert call_order == ["load", "annotate", "chunk", "index", "retrieve"]
 
@@ -744,7 +744,7 @@ class TestClassifyQuery:
         assert pipeline._classify_query("test") == "packaging_specification"
 
     def test_prompt_contains_all_categories(self, pipeline):
-        from rag_pipeline import _PHARMA_DOC_CATEGORIES
+        from rag.pipeline import _PHARMA_DOC_CATEGORIES
         pipeline.llm.complete.return_value = MagicMock(text="unknown")
         pipeline._classify_query("How is the material sourced?")
         prompt = pipeline.llm.complete.call_args[0][0]
@@ -758,7 +758,7 @@ class TestClassifyQuery:
         assert "What is the batch number?" in prompt
 
     def test_all_valid_categories_accepted(self, pipeline):
-        from rag_pipeline import _PHARMA_DOC_CATEGORIES
+        from rag.pipeline import _PHARMA_DOC_CATEGORIES
         for cat in _PHARMA_DOC_CATEGORIES:
             pipeline.llm.complete.return_value = MagicMock(text=cat)
             assert pipeline._classify_query("q") == cat
@@ -791,7 +791,7 @@ class TestClassifyDocument:
         assert "X" * 601 not in prompt
 
     def test_prompt_contains_all_categories(self, pipeline):
-        from rag_pipeline import _PHARMA_DOC_CATEGORIES
+        from rag.pipeline import _PHARMA_DOC_CATEGORIES
         pipeline.llm.complete.return_value = MagicMock(text="unknown")
         pipeline._classify_document("page text")
         prompt = pipeline.llm.complete.call_args[0][0]
@@ -866,12 +866,12 @@ class TestBuildFilteredEngine:
         pipeline._vector_index = MagicMock(name="index")
         pipeline._chunks = [_make_chunk("certificate_of_quality")]
 
-        with patch("rag_pipeline.VectorIndexRetriever") as mock_vr, \
-             patch("rag_pipeline.BM25Retriever") as mock_bm25, \
-             patch("rag_pipeline.QueryFusionRetriever") as mock_qfr, \
-             patch("rag_pipeline.RetrieverQueryEngine") as mock_qe, \
-             patch("rag_pipeline.MetadataFilters") as mock_filters_cls, \
-             patch("rag_pipeline.MetadataFilter") as mock_filter_cls:
+        with patch("rag.pipeline.VectorIndexRetriever") as mock_vr, \
+             patch("rag.pipeline.BM25Retriever") as mock_bm25, \
+             patch("rag.pipeline.QueryFusionRetriever") as mock_qfr, \
+             patch("rag.pipeline.RetrieverQueryEngine") as mock_qe, \
+             patch("rag.pipeline.MetadataFilters") as mock_filters_cls, \
+             patch("rag.pipeline.MetadataFilter") as mock_filter_cls:
             pipeline._build_filtered_engine("certificate_of_quality")
 
         mock_filter_cls.assert_called_once_with(key="pharma_doc_type", value="certificate_of_quality")
@@ -886,12 +886,12 @@ class TestBuildFilteredEngine:
             _make_chunk("certificate_of_quality"),
         ]
 
-        with patch("rag_pipeline.VectorIndexRetriever"), \
-             patch("rag_pipeline.BM25Retriever") as mock_bm25, \
-             patch("rag_pipeline.QueryFusionRetriever"), \
-             patch("rag_pipeline.RetrieverQueryEngine"), \
-             patch("rag_pipeline.MetadataFilters"), \
-             patch("rag_pipeline.MetadataFilter"):
+        with patch("rag.pipeline.VectorIndexRetriever"), \
+             patch("rag.pipeline.BM25Retriever") as mock_bm25, \
+             patch("rag.pipeline.QueryFusionRetriever"), \
+             patch("rag.pipeline.RetrieverQueryEngine"), \
+             patch("rag.pipeline.MetadataFilters"), \
+             patch("rag.pipeline.MetadataFilter"):
             pipeline._build_filtered_engine("certificate_of_quality")
 
         called_nodes = mock_bm25.from_defaults.call_args.kwargs.get(
@@ -906,12 +906,12 @@ class TestBuildFilteredEngine:
         pipeline._vector_index = MagicMock(name="index")
         pipeline._chunks = [_make_chunk("cover_letter")]  # no CoQ chunks
 
-        with patch("rag_pipeline.VectorIndexRetriever") as mock_vr, \
-             patch("rag_pipeline.BM25Retriever") as mock_bm25, \
-             patch("rag_pipeline.QueryFusionRetriever") as mock_qfr, \
-             patch("rag_pipeline.RetrieverQueryEngine"), \
-             patch("rag_pipeline.MetadataFilters"), \
-             patch("rag_pipeline.MetadataFilter"):
+        with patch("rag.pipeline.VectorIndexRetriever") as mock_vr, \
+             patch("rag.pipeline.BM25Retriever") as mock_bm25, \
+             patch("rag.pipeline.QueryFusionRetriever") as mock_qfr, \
+             patch("rag.pipeline.RetrieverQueryEngine"), \
+             patch("rag.pipeline.MetadataFilters"), \
+             patch("rag.pipeline.MetadataFilter"):
             pipeline._build_filtered_engine("certificate_of_quality")
 
         mock_bm25.from_defaults.assert_not_called()
@@ -926,12 +926,12 @@ class TestBuildFilteredEngine:
         pipeline._chunks = [_make_chunk("cover_letter")]
         fake_engine = MagicMock(name="filtered_engine")
 
-        with patch("rag_pipeline.VectorIndexRetriever"), \
-             patch("rag_pipeline.BM25Retriever"), \
-             patch("rag_pipeline.QueryFusionRetriever"), \
-             patch("rag_pipeline.RetrieverQueryEngine") as mock_qe, \
-             patch("rag_pipeline.MetadataFilters"), \
-             patch("rag_pipeline.MetadataFilter"):
+        with patch("rag.pipeline.VectorIndexRetriever"), \
+             patch("rag.pipeline.BM25Retriever"), \
+             patch("rag.pipeline.QueryFusionRetriever"), \
+             patch("rag.pipeline.RetrieverQueryEngine") as mock_qe, \
+             patch("rag.pipeline.MetadataFilters"), \
+             patch("rag.pipeline.MetadataFilter"):
             mock_qe.from_args.return_value = fake_engine
             result = pipeline._build_filtered_engine("cover_letter")
 
@@ -1078,3 +1078,4 @@ class TestQueryWithSourcesClassify:
         self._attach_engine(pipeline, [node])
         result = pipeline.query_with_sources("test?")
         assert result["sources"][0]["pharma_doc_type"] == "unknown"
+

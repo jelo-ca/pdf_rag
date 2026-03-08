@@ -3,11 +3,11 @@ CI-friendly module stubs
 ========================
 When heavy ML dependencies (llama-index, torch, llama-cpp-python, …) are not
 installed – as is the case in lightweight CI environments – this conftest
-pre-populates sys.modules with MagicMock stubs so that ``rag_pipeline.py``
+pre-populates sys.modules with MagicMock stubs so that ``rag.pipeline``
 can be imported without those packages present.
 
 The test fixtures in ``test_rag_pipeline.py`` patch the same symbols at the
-``rag_pipeline`` namespace level (e.g. ``patch("rag_pipeline.LlamaCPP")``),
+``rag.pipeline`` namespace level (e.g. ``patch("rag.pipeline.LlamaCPP")``),
 which is fully compatible with the stubs set here.
 
 When the packages *are* installed (local dev), the real modules are used.
