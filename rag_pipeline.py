@@ -106,15 +106,19 @@ _KEYWORD_MAP: Dict[str, List[str]] = {
 # fails.  Short excerpts are enough — the goal is to anchor the format.
 _FEW_SHOT_EXAMPLES: str = (
     "cover_letter\n"
-    "Example: \"Dear Supplier, Please find enclosed the updated documentation for batch 2024-001.\"\n\n"
+    "Example: \"Dear Supplier, Please find enclosed the updated documentation "
+    "for batch 2024-001.\"\n\n"
     "certificate_of_quality\n"
-    "Example: \"Certificate of Quality — Batch No: 12345 — Product: Excipient X — Conforms to specification.\"\n\n"
+    "Example: \"Certificate of Quality — Batch No: 12345 — Product: "
+    "Excipient X — Conforms to specification.\"\n\n"
     "packaging_specification\n"
-    "Example: \"Packaging Specification Rev. 3 — Primary container: HDPE bottle 250 mL — Closure torque: 15–20 Nm.\"\n\n"
+    "Example: \"Packaging Specification Rev. 3 — Primary container: "
+    "HDPE bottle 250 mL — Closure torque: 15–20 Nm.\"\n\n"
     "bse_tse_declaration\n"
     "Example: \"BSE/TSE Declaration — We confirm that no materials of bovine or ovine origin are used.\"\n\n"
     "material_description\n"
-    "Example: \"Material Description — Chemical name: Microcrystalline Cellulose — CAS: 9004-34-6 — Function: Filler.\"\n\n"
+    "Example: \"Material Description — Chemical name: Microcrystalline "
+    "Cellulose — CAS: 9004-34-6 — Function: Filler.\"\n\n"
     "supplier_qualification\n"
     "Example: \"Supplier Qualification Report — Audit date: 2023-05 — Site: Plant A — Status: Approved.\"\n\n"
     "chain_of_custody\n"
@@ -124,6 +128,9 @@ _FEW_SHOT_EXAMPLES: str = (
 # DPI used when rasterising a PDF page for OCR. 200 dpi gives a good
 # balance between OCR accuracy, memory usage, and speed.
 _OCR_DPI = 200
+
+# Max number of page-text characters included in LLM doc-classification prompt.
+_DOC_CLASSIFY_PROMPT_CHARS = 600
 
 
 class RAGPipeline:
@@ -186,7 +193,7 @@ class RAGPipeline:
         _top_k: int = (
             similarity_top_k
             if similarity_top_k is not None
-            else int(os.getenv("SIMILARITY_TOP_K", "3"))
+            else int(os.getenv("SIMILARITY_TOP_K", "5"))
         )
         _gpu_layers: int = (
             n_gpu_layers
@@ -280,14 +287,14 @@ class RAGPipeline:
             for i, page in enumerate(doc):
                 text = page.get_text()
                 page_data.append((i, page, text))
-            
+
             # Parallel OCR processing for scanned pages
             if _OCR_AVAILABLE:
                 pages_needing_ocr = [
                     (i, page) for i, page, text in page_data
                     if len(text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD
                 ]
-                
+
                 if pages_needing_ocr:
                     with ThreadPoolExecutor(max_workers=4) as executor:
                         ocr_results = list(executor.map(
@@ -299,14 +306,14 @@ class RAGPipeline:
                     ocr_dict = {}
             else:
                 ocr_dict = {}
-            
+
             # Build documents
             for i, page, text in page_data:
                 ocr_used = False
                 if i in ocr_dict:
                     text = ocr_dict[i]
                     ocr_used = True
-                
+
                 if not text.strip():
                     continue
 
@@ -376,11 +383,11 @@ class RAGPipeline:
         """
         vector_index = VectorStoreIndex.from_documents(chunks)
         logger.info("Indexed %d chunks.", len(chunks))
-        
+
         if self.persist_dir:
             vector_index.storage_context.persist(persist_dir=self.persist_dir)
             logger.info("Index persisted to %s", self.persist_dir)
-        
+
         return vector_index
 
     # ------------------------------------------------------------------
@@ -503,6 +510,7 @@ class RAGPipeline:
                 return cat
 
         # Stage 2: few-shot LLM classification for ambiguous pages
+        snippet = text[:_DOC_CLASSIFY_PROMPT_CHARS]
         categories_str = ", ".join(_PHARMA_DOC_CATEGORIES)
         prompt = (
             "You are an expert pharmaceutical document classifier.\n"
@@ -511,7 +519,7 @@ class RAGPipeline:
             "Respond with only the category name in snake_case. No extra text.\n\n"
             "Examples:\n"
             f"{_FEW_SHOT_EXAMPLES}"
-            f"Document text:\n{text[:800]}\n\n"
+            f"Document text:\n{snippet}\n\n"
             "Category:"
         )
         response = self.llm.complete(prompt)
@@ -620,7 +628,7 @@ class RAGPipeline:
                 reduce LLM calls.
         """
         self._pdf_path = pdf_path
-        
+
         # Try to load existing index if persistence is enabled
         if self.persist_dir and os.path.exists(self.persist_dir):
             try:
@@ -642,10 +650,10 @@ class RAGPipeline:
                 else:
                     self._docs_classified = loaded_classified
                     logger.info("Loaded index with %d chunks.", len(self._chunks))
-            except Exception as e:
+            except (FileNotFoundError, OSError, ValueError, RuntimeError) as e:
                 logger.warning("Failed to load persisted index: %s. Building new index.", e)
                 self._vector_index = None
-        
+
         # Build new index if not loaded
         if self._vector_index is None:
             documents = self.load_pdf(pdf_path)
@@ -654,7 +662,7 @@ class RAGPipeline:
             self._docs_classified = classify_docs
             self._chunks = self._chunk(documents)
             self._vector_index = self._index(self._chunks)
-        
+
         hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
 
         self._query_engine = RetrieverQueryEngine.from_args(

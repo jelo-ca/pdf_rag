@@ -111,8 +111,10 @@ class TestInit:
 
         assert mock_llm_cls.call_args.kwargs["model_path"] == str(fake_model)
 
-    def test_default_similarity_top_k_is_5(self, fake_model_path):
+    def test_default_similarity_top_k_is_5(self, fake_model_path, monkeypatch):
         from rag_pipeline import RAGPipeline
+
+        monkeypatch.delenv("SIMILARITY_TOP_K", raising=False)
 
         with patch("rag_pipeline.LlamaCPP"), \
              patch("rag_pipeline.HuggingFaceEmbedding"), \
