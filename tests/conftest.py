@@ -29,6 +29,12 @@ def _available(module: str) -> bool:
 
 
 if not _available("llama_index"):
+    # Minimal Document stub: stores text + metadata so tests can inspect them.
+    class _Document:
+        def __init__(self, text: str = "", metadata: dict = None, **kwargs):
+            self.text = text
+            self.metadata = metadata or {}
+
     _STUBS = [
         "torch",
         "sentence_transformers",
@@ -48,3 +54,6 @@ if not _available("llama_index"):
     ]
     for _mod in _STUBS:
         sys.modules.setdefault(_mod, MagicMock())
+
+    # Inject the proper Document stub so metadata is preserved after construction.
+    sys.modules["llama_index.core"].Document = _Document
