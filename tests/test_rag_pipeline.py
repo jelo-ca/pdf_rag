@@ -55,6 +55,7 @@ def _make_source_node(
     page=1,
     score=0.8,
     doc_type="digital",
+    pharma_doc_type="unknown",
 ):
     """Factory for mocked NodeWithScore objects returned by the query engine."""
     node_inner = MagicMock()
@@ -62,6 +63,7 @@ def _make_source_node(
         "file_name": file,
         "page_number": page,
         "doc_type": doc_type,
+        "pharma_doc_type": pharma_doc_type,
     }
     node_inner.text = text
 
@@ -69,6 +71,13 @@ def _make_source_node(
     source_node.score = score
     source_node.node = node_inner
     return source_node
+
+
+def _make_chunk(pharma_doc_type="certificate_of_quality"):
+    """Factory for mocked BaseNode chunks stored in pipeline._chunks."""
+    chunk = MagicMock()
+    chunk.metadata = {"pharma_doc_type": pharma_doc_type}
+    return chunk
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +162,7 @@ class TestInit:
         assert pipeline._query_engine is None
         assert pipeline._pdf_path is None
         assert pipeline._chunks == []
+        assert pipeline._docs_classified is False
 
     def test_default_num_queries_is_1(self, pipeline):
         assert pipeline.num_queries == 1
@@ -413,7 +423,7 @@ class TestQueryWithSources:
     def test_result_has_expected_keys(self, pipeline):
         self._attach_engine(pipeline, [_make_source_node(score=0.9)])
         result = pipeline.query_with_sources("test?")
-        assert set(result.keys()) == {"answer", "sources", "chunk_count"}
+        assert set(result.keys()) == {"answer", "sources", "chunk_count", "query_category"}
 
     def test_chunk_count_matches_source_list_length(self, pipeline):
         nodes = [_make_source_node(), _make_source_node()]
@@ -456,6 +466,7 @@ class TestQueryWithSources:
             page=3,
             score=1.0,
             doc_type="scanned",
+            pharma_doc_type="certificate_of_quality",
         )
         self._attach_engine(pipeline, [node])
         src = pipeline.query_with_sources("test?")["sources"][0]
@@ -463,6 +474,7 @@ class TestQueryWithSources:
         assert src["file"] == "pfizer.pdf"
         assert src["page"] == 3
         assert src["doc_type"] == "scanned"
+        assert src["pharma_doc_type"] == "certificate_of_quality"
 
     def test_missing_metadata_uses_defaults(self, pipeline):
         node = MagicMock()
@@ -474,6 +486,7 @@ class TestQueryWithSources:
         assert src["file"] == "unknown"
         assert src["page"] == "?"
         assert src["doc_type"] == "digital"
+        assert src["pharma_doc_type"] == "unknown"
 
     def test_empty_source_nodes_returns_zero_chunks(self, pipeline):
         self._attach_engine(pipeline, [])
@@ -629,3 +642,437 @@ class TestBuild:
         fake_pdf = str(tmp_path / "doc.pdf")
         ctx = self._run_build(pipeline, fake_pdf)
         ctx["p_ret"].assert_called_once_with(ctx["index"], ctx["chunks"])
+
+
+# ---------------------------------------------------------------------------
+# build – classify_docs flag
+# ---------------------------------------------------------------------------
+
+class TestBuildWithClassification:
+
+    def test_docs_classified_false_by_default(self, pipeline, tmp_path):
+        fake_pdf = str(tmp_path / "doc.pdf")
+        with patch.object(pipeline, "load_pdf", return_value=[MagicMock()]), \
+             patch.object(pipeline, "_chunk", return_value=[MagicMock()]), \
+             patch.object(pipeline, "_index", return_value=MagicMock()), \
+             patch.object(pipeline, "_build_retriever", return_value=MagicMock()), \
+             patch("rag_pipeline.RetrieverQueryEngine"):
+            pipeline.build(fake_pdf)
+        assert pipeline._docs_classified is False
+
+    def test_docs_classified_true_when_flag_set(self, pipeline, tmp_path):
+        fake_pdf = str(tmp_path / "doc.pdf")
+        with patch.object(pipeline, "load_pdf", return_value=[MagicMock()]), \
+             patch.object(pipeline, "_annotate_pharma_doc_types", return_value=[MagicMock()]) as mock_ann, \
+             patch.object(pipeline, "_chunk", return_value=[MagicMock()]), \
+             patch.object(pipeline, "_index", return_value=MagicMock()), \
+             patch.object(pipeline, "_build_retriever", return_value=MagicMock()), \
+             patch("rag_pipeline.RetrieverQueryEngine"):
+            pipeline.build(fake_pdf, classify_docs=True)
+        assert pipeline._docs_classified is True
+        mock_ann.assert_called_once()
+
+    def test_annotate_not_called_when_classify_docs_false(self, pipeline, tmp_path):
+        fake_pdf = str(tmp_path / "doc.pdf")
+        with patch.object(pipeline, "load_pdf", return_value=[MagicMock()]), \
+             patch.object(pipeline, "_annotate_pharma_doc_types") as mock_ann, \
+             patch.object(pipeline, "_chunk", return_value=[MagicMock()]), \
+             patch.object(pipeline, "_index", return_value=MagicMock()), \
+             patch.object(pipeline, "_build_retriever", return_value=MagicMock()), \
+             patch("rag_pipeline.RetrieverQueryEngine"):
+            pipeline.build(fake_pdf, classify_docs=False)
+        mock_ann.assert_not_called()
+
+    def test_annotate_receives_load_pdf_output(self, pipeline, tmp_path):
+        fake_pdf = str(tmp_path / "doc.pdf")
+        mock_docs = [MagicMock(), MagicMock()]
+        annotated = [MagicMock(), MagicMock()]
+        with patch.object(pipeline, "load_pdf", return_value=mock_docs), \
+             patch.object(pipeline, "_annotate_pharma_doc_types", return_value=annotated) as mock_ann, \
+             patch.object(pipeline, "_chunk", return_value=[MagicMock()]) as mock_chunk, \
+             patch.object(pipeline, "_index", return_value=MagicMock()), \
+             patch.object(pipeline, "_build_retriever", return_value=MagicMock()), \
+             patch("rag_pipeline.RetrieverQueryEngine"):
+            pipeline.build(fake_pdf, classify_docs=True)
+        mock_ann.assert_called_once_with(mock_docs)
+        mock_chunk.assert_called_once_with(annotated)
+
+    def test_stage_order_with_classification(self, pipeline, tmp_path):
+        fake_pdf = str(tmp_path / "doc.pdf")
+        call_order = []
+        with patch.object(pipeline, "load_pdf", side_effect=lambda p: call_order.append("load") or [MagicMock()]), \
+             patch.object(pipeline, "_annotate_pharma_doc_types", side_effect=lambda d: call_order.append("annotate") or d), \
+             patch.object(pipeline, "_chunk", side_effect=lambda d: call_order.append("chunk") or [MagicMock()]), \
+             patch.object(pipeline, "_index", side_effect=lambda c: call_order.append("index") or MagicMock()), \
+             patch.object(pipeline, "_build_retriever", side_effect=lambda i, c: call_order.append("retrieve") or MagicMock()), \
+             patch("rag_pipeline.RetrieverQueryEngine"):
+            pipeline.build(fake_pdf, classify_docs=True)
+        assert call_order == ["load", "annotate", "chunk", "index", "retrieve"]
+
+
+# ---------------------------------------------------------------------------
+# _classify_query
+# ---------------------------------------------------------------------------
+
+class TestClassifyQuery:
+
+    def test_returns_valid_category(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="certificate_of_quality")
+        assert pipeline._classify_query("What is the purity?") == "certificate_of_quality"
+
+    def test_returns_unknown_for_unrecognized_response(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="garbage_value")
+        assert pipeline._classify_query("test") == "unknown"
+
+    def test_returns_unknown_for_empty_response(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="")
+        assert pipeline._classify_query("test") == "unknown"
+
+    def test_returns_unknown_for_whitespace_response(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="   \n  ")
+        assert pipeline._classify_query("test") == "unknown"
+
+    def test_normalizes_to_lowercase(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="COVER_LETTER")
+        assert pipeline._classify_query("test") == "cover_letter"
+
+    def test_takes_last_word_of_multiword_response(self, pipeline):
+        """LLM sometimes adds preamble; only the last word should be used."""
+        pipeline.llm.complete.return_value = MagicMock(text="The answer is: packaging_specification")
+        assert pipeline._classify_query("test") == "packaging_specification"
+
+    def test_prompt_contains_all_categories(self, pipeline):
+        from rag_pipeline import _PHARMA_DOC_CATEGORIES
+        pipeline.llm.complete.return_value = MagicMock(text="unknown")
+        pipeline._classify_query("How is the material sourced?")
+        prompt = pipeline.llm.complete.call_args[0][0]
+        for cat in _PHARMA_DOC_CATEGORIES:
+            assert cat in prompt
+
+    def test_prompt_contains_query(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="unknown")
+        pipeline._classify_query("What is the batch number?")
+        prompt = pipeline.llm.complete.call_args[0][0]
+        assert "What is the batch number?" in prompt
+
+    def test_all_valid_categories_accepted(self, pipeline):
+        from rag_pipeline import _PHARMA_DOC_CATEGORIES
+        for cat in _PHARMA_DOC_CATEGORIES:
+            pipeline.llm.complete.return_value = MagicMock(text=cat)
+            assert pipeline._classify_query("q") == cat
+
+
+# ---------------------------------------------------------------------------
+# _classify_document
+# ---------------------------------------------------------------------------
+
+class TestClassifyDocument:
+
+    def test_returns_valid_category(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="bse_tse_declaration")
+        assert pipeline._classify_document("BSE/TSE declaration text") == "bse_tse_declaration"
+
+    def test_returns_unknown_for_unrecognized_response(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="nonsense")
+        assert pipeline._classify_document("some text") == "unknown"
+
+    def test_returns_unknown_for_empty_response(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="")
+        assert pipeline._classify_document("some text") == "unknown"
+
+    def test_prompt_includes_first_600_chars_only(self, pipeline):
+        pipeline.llm.complete.return_value = MagicMock(text="unknown")
+        long_text = "X" * 2000
+        pipeline._classify_document(long_text)
+        prompt = pipeline.llm.complete.call_args[0][0]
+        assert "X" * 600 in prompt
+        assert "X" * 601 not in prompt
+
+    def test_prompt_contains_all_categories(self, pipeline):
+        from rag_pipeline import _PHARMA_DOC_CATEGORIES
+        pipeline.llm.complete.return_value = MagicMock(text="unknown")
+        pipeline._classify_document("page text")
+        prompt = pipeline.llm.complete.call_args[0][0]
+        for cat in _PHARMA_DOC_CATEGORIES:
+            assert cat in prompt
+
+
+# ---------------------------------------------------------------------------
+# _annotate_pharma_doc_types
+# ---------------------------------------------------------------------------
+
+class TestAnnotatePharmaDocTypes:
+
+    def _make_doc(self, text="sample text", page=1):
+        from llama_index.core import Document
+        return Document(text=text, metadata={"page_number": page, "file_name": "doc.pdf"})
+
+    def test_calls_classify_document_for_each_page(self, pipeline):
+        docs = [self._make_doc(text=f"page {i}") for i in range(3)]
+        pipeline.llm.complete.return_value = MagicMock(text="cover_letter")
+        with patch.object(pipeline, "_classify_document", return_value="cover_letter") as mock_cls:
+            pipeline._annotate_pharma_doc_types(docs)
+        assert mock_cls.call_count == 3
+
+    def test_sets_pharma_doc_type_on_each_document(self, pipeline):
+        docs = [self._make_doc(text=f"page {i}") for i in range(2)]
+        with patch.object(pipeline, "_classify_document", return_value="material_description"):
+            result = pipeline._annotate_pharma_doc_types(docs)
+        for doc in result:
+            assert doc.metadata["pharma_doc_type"] == "material_description"
+
+    def test_returns_same_list_object(self, pipeline):
+        docs = [self._make_doc()]
+        with patch.object(pipeline, "_classify_document", return_value="unknown"):
+            result = pipeline._annotate_pharma_doc_types(docs)
+        assert result is docs
+
+    def test_preserves_existing_metadata(self, pipeline):
+        docs = [self._make_doc(page=7)]
+        with patch.object(pipeline, "_classify_document", return_value="cover_letter"):
+            result = pipeline._annotate_pharma_doc_types(docs)
+        assert result[0].metadata["page_number"] == 7
+        assert result[0].metadata["file_name"] == "doc.pdf"
+
+    def test_per_page_category_can_differ(self, pipeline):
+        docs = [self._make_doc(text="p1"), self._make_doc(text="p2")]
+        categories = ["cover_letter", "certificate_of_quality"]
+        with patch.object(pipeline, "_classify_document", side_effect=categories):
+            result = pipeline._annotate_pharma_doc_types(docs)
+        assert result[0].metadata["pharma_doc_type"] == "cover_letter"
+        assert result[1].metadata["pharma_doc_type"] == "certificate_of_quality"
+
+    def test_empty_list_returns_empty(self, pipeline):
+        with patch.object(pipeline, "_classify_document") as mock_cls:
+            result = pipeline._annotate_pharma_doc_types([])
+        mock_cls.assert_not_called()
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _build_filtered_engine
+# ---------------------------------------------------------------------------
+
+class TestBuildFilteredEngine:
+
+    def test_raises_when_index_is_none(self, pipeline):
+        pipeline._vector_index = None
+        with pytest.raises(RuntimeError, match="Pipeline not built"):
+            pipeline._build_filtered_engine("certificate_of_quality")
+
+    def test_vector_retriever_receives_metadata_filter(self, pipeline):
+        pipeline._vector_index = MagicMock(name="index")
+        pipeline._chunks = [_make_chunk("certificate_of_quality")]
+
+        with patch("rag_pipeline.VectorIndexRetriever") as mock_vr, \
+             patch("rag_pipeline.BM25Retriever") as mock_bm25, \
+             patch("rag_pipeline.QueryFusionRetriever") as mock_qfr, \
+             patch("rag_pipeline.RetrieverQueryEngine") as mock_qe, \
+             patch("rag_pipeline.MetadataFilters") as mock_filters_cls, \
+             patch("rag_pipeline.MetadataFilter") as mock_filter_cls:
+            pipeline._build_filtered_engine("certificate_of_quality")
+
+        mock_filter_cls.assert_called_once_with(key="pharma_doc_type", value="certificate_of_quality")
+        mock_filters_cls.assert_called_once()
+        mock_vr.assert_called_once()
+
+    def test_bm25_receives_only_matching_chunks(self, pipeline):
+        pipeline._vector_index = MagicMock(name="index")
+        pipeline._chunks = [
+            _make_chunk("certificate_of_quality"),
+            _make_chunk("cover_letter"),
+            _make_chunk("certificate_of_quality"),
+        ]
+
+        with patch("rag_pipeline.VectorIndexRetriever"), \
+             patch("rag_pipeline.BM25Retriever") as mock_bm25, \
+             patch("rag_pipeline.QueryFusionRetriever"), \
+             patch("rag_pipeline.RetrieverQueryEngine"), \
+             patch("rag_pipeline.MetadataFilters"), \
+             patch("rag_pipeline.MetadataFilter"):
+            pipeline._build_filtered_engine("certificate_of_quality")
+
+        called_nodes = mock_bm25.from_defaults.call_args.kwargs.get(
+            "nodes", mock_bm25.from_defaults.call_args[1].get("nodes",
+            mock_bm25.from_defaults.call_args[0][0] if mock_bm25.from_defaults.call_args[0] else None)
+        )
+        assert len(called_nodes) == 2
+        for n in called_nodes:
+            assert n.metadata["pharma_doc_type"] == "certificate_of_quality"
+
+    def test_only_vector_retriever_when_no_matching_chunks(self, pipeline):
+        pipeline._vector_index = MagicMock(name="index")
+        pipeline._chunks = [_make_chunk("cover_letter")]  # no CoQ chunks
+
+        with patch("rag_pipeline.VectorIndexRetriever") as mock_vr, \
+             patch("rag_pipeline.BM25Retriever") as mock_bm25, \
+             patch("rag_pipeline.QueryFusionRetriever") as mock_qfr, \
+             patch("rag_pipeline.RetrieverQueryEngine"), \
+             patch("rag_pipeline.MetadataFilters"), \
+             patch("rag_pipeline.MetadataFilter"):
+            pipeline._build_filtered_engine("certificate_of_quality")
+
+        mock_bm25.from_defaults.assert_not_called()
+        retrievers_arg = mock_qfr.call_args.kwargs.get(
+            "retrievers", mock_qfr.call_args[1].get("retrievers",
+            mock_qfr.call_args[0][0] if mock_qfr.call_args[0] else None)
+        )
+        assert len(retrievers_arg) == 1
+
+    def test_returns_engine_from_query_engine_factory(self, pipeline):
+        pipeline._vector_index = MagicMock(name="index")
+        pipeline._chunks = [_make_chunk("cover_letter")]
+        fake_engine = MagicMock(name="filtered_engine")
+
+        with patch("rag_pipeline.VectorIndexRetriever"), \
+             patch("rag_pipeline.BM25Retriever"), \
+             patch("rag_pipeline.QueryFusionRetriever"), \
+             patch("rag_pipeline.RetrieverQueryEngine") as mock_qe, \
+             patch("rag_pipeline.MetadataFilters"), \
+             patch("rag_pipeline.MetadataFilter"):
+            mock_qe.from_args.return_value = fake_engine
+            result = pipeline._build_filtered_engine("cover_letter")
+
+        assert result is fake_engine
+
+
+# ---------------------------------------------------------------------------
+# query – classify flag
+# ---------------------------------------------------------------------------
+
+class TestQueryClassify:
+
+    def _attach_engine(self, pipeline, answer="Answer."):
+        mock_engine = MagicMock()
+        mock_response = MagicMock()
+        mock_response.__str__ = MagicMock(return_value=answer)
+        mock_engine.query.return_value = mock_response
+        pipeline._query_engine = mock_engine
+        return mock_engine
+
+    def test_classify_false_uses_default_engine(self, pipeline):
+        engine = self._attach_engine(pipeline)
+        with patch.object(pipeline, "_classify_query") as mock_cls, \
+             patch.object(pipeline, "_build_filtered_engine") as mock_fe:
+            pipeline.query("What is the purity?", classify=False)
+        mock_cls.assert_not_called()
+        mock_fe.assert_not_called()
+        engine.query.assert_called_once()
+
+    def test_classify_true_without_docs_classified_uses_default_engine(self, pipeline):
+        """When classify=True but docs were not classified at build time,
+        query() skips both classification and filtering (no category to filter on)
+        and falls back to the default engine."""
+        engine = self._attach_engine(pipeline)
+        pipeline._docs_classified = False
+        with patch.object(pipeline, "_classify_query") as mock_cls, \
+             patch.object(pipeline, "_build_filtered_engine") as mock_fe:
+            pipeline.query("test", classify=True)
+        mock_cls.assert_not_called()
+        mock_fe.assert_not_called()
+        engine.query.assert_called_once()
+
+    def test_classify_true_with_docs_classified_uses_filtered_engine(self, pipeline):
+        self._attach_engine(pipeline)
+        pipeline._docs_classified = True
+        pipeline._vector_index = MagicMock()
+        filtered_engine = MagicMock()
+        filtered_response = MagicMock()
+        filtered_response.__str__ = MagicMock(return_value="filtered answer")
+        filtered_engine.query.return_value = filtered_response
+
+        with patch.object(pipeline, "_classify_query", return_value="certificate_of_quality"), \
+             patch.object(pipeline, "_build_filtered_engine", return_value=filtered_engine) as mock_fe:
+            result = pipeline.query("What is the purity?", classify=True)
+
+        mock_fe.assert_called_once_with("certificate_of_quality")
+        assert result == "filtered answer"
+
+    def test_classify_unknown_category_uses_default_engine(self, pipeline):
+        engine = self._attach_engine(pipeline)
+        pipeline._docs_classified = True
+        pipeline._vector_index = MagicMock()
+        with patch.object(pipeline, "_classify_query", return_value="unknown"), \
+             patch.object(pipeline, "_build_filtered_engine") as mock_fe:
+            pipeline.query("test", classify=True)
+        mock_fe.assert_not_called()
+        engine.query.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# query_with_sources – classify flag
+# ---------------------------------------------------------------------------
+
+class TestQueryWithSourcesClassify:
+
+    def _attach_engine(self, pipeline, source_nodes=None, answer="Answer."):
+        mock_engine = MagicMock()
+        mock_response = MagicMock()
+        mock_response.__str__ = MagicMock(return_value=answer)
+        mock_response.source_nodes = source_nodes or []
+        mock_engine.query.return_value = mock_response
+        pipeline._query_engine = mock_engine
+        return mock_engine
+
+    def test_query_category_none_when_classify_false(self, pipeline):
+        self._attach_engine(pipeline, [_make_source_node()])
+        result = pipeline.query_with_sources("test?", classify=False)
+        assert result["query_category"] is None
+
+    def test_query_category_returned_when_classify_true(self, pipeline):
+        self._attach_engine(pipeline)
+        pipeline._docs_classified = False
+        with patch.object(pipeline, "_classify_query", return_value="packaging_specification"):
+            result = pipeline.query_with_sources("test?", classify=True)
+        assert result["query_category"] == "packaging_specification"
+
+    def test_filtered_engine_used_when_docs_classified(self, pipeline):
+        self._attach_engine(pipeline)
+        pipeline._docs_classified = True
+        pipeline._vector_index = MagicMock()
+        filtered_engine = MagicMock()
+        filtered_response = MagicMock()
+        filtered_response.__str__ = MagicMock(return_value="filtered")
+        filtered_response.source_nodes = []
+        filtered_engine.query.return_value = filtered_response
+
+        with patch.object(pipeline, "_classify_query", return_value="cover_letter"), \
+             patch.object(pipeline, "_build_filtered_engine", return_value=filtered_engine) as mock_fe:
+            result = pipeline.query_with_sources("test?", classify=True)
+
+        mock_fe.assert_called_once_with("cover_letter")
+        assert result["query_category"] == "cover_letter"
+
+    def test_default_engine_used_when_docs_not_classified(self, pipeline):
+        engine = self._attach_engine(pipeline)
+        pipeline._docs_classified = False
+        with patch.object(pipeline, "_classify_query", return_value="cover_letter"), \
+             patch.object(pipeline, "_build_filtered_engine") as mock_fe:
+            pipeline.query_with_sources("test?", classify=True)
+        mock_fe.assert_not_called()
+        engine.query.assert_called_once()
+
+    def test_unknown_category_uses_default_engine(self, pipeline):
+        engine = self._attach_engine(pipeline)
+        pipeline._docs_classified = True
+        pipeline._vector_index = MagicMock()
+        with patch.object(pipeline, "_classify_query", return_value="unknown"), \
+             patch.object(pipeline, "_build_filtered_engine") as mock_fe:
+            pipeline.query_with_sources("test?", classify=True)
+        mock_fe.assert_not_called()
+        engine.query.assert_called_once()
+
+    def test_sources_include_pharma_doc_type(self, pipeline):
+        node = _make_source_node(score=1.0, pharma_doc_type="chain_of_custody")
+        self._attach_engine(pipeline, [node])
+        result = pipeline.query_with_sources("test?")
+        assert result["sources"][0]["pharma_doc_type"] == "chain_of_custody"
+
+    def test_pharma_doc_type_defaults_to_unknown_when_missing(self, pipeline):
+        node = MagicMock()
+        node.score = 1.0
+        node.node.metadata = {}
+        node.node.text = "text"
+        self._attach_engine(pipeline, [node])
+        result = pipeline.query_with_sources("test?")
+        assert result["sources"][0]["pharma_doc_type"] == "unknown"

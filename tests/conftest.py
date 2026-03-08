@@ -45,6 +45,8 @@ if not _available("llama_index"):
         "llama_index.core.prompts",
         "llama_index.core.query_engine",
         "llama_index.core.retrievers",
+        "llama_index.core.vector_stores",
+        "llama_index.core.vector_stores.types",
         "llama_index.embeddings",
         "llama_index.embeddings.huggingface",
         "llama_index.llms",
