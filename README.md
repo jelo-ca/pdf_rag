@@ -417,7 +417,7 @@ Pylint is configured via [`.pylintrc`](.pylintrc) and [`pyproject.toml`](pyproje
 
 ```bash
 pip install pylint
-pylint rag_pipeline.py
+pylint src/
 ```
 
 ---
@@ -455,16 +455,24 @@ Call `rag.build("document.pdf")` before calling `query()` or `query_with_sources
 
 ```
 RAG/
-├── rag_pipeline.py       # Core RAGPipeline class
-├── rag.ipynb             # Gradio UI notebook
-├── rag_spec.md           # Feature specification
+├── src/
+│   └── rag/              # Core RAGPipeline package
+│       ├── __init__.py
+│       ├── pipeline.py   # Core RAGPipeline class
+│       └── demos/
+│           └── multi_file.py
+├── tests/                # Test suite
+│   ├── conftest.py
+│   └── test_rag_pipeline.py
+├── notebooks/
+│   └── rag.ipynb         # Gradio UI notebook
+├── docs/                 # Sample documents
+├── storage/              # Persisted index data
 ├── requirements.txt      # Runtime dependencies
 ├── requirements-dev.txt  # Dev dependencies (pylint, jupyter, isort)
 ├── .env.example          # Environment variable template
 ├── .env                  # Your local config (gitignored)
 ├── .pylintrc             # Pylint configuration
 ├── pyproject.toml        # Tool configuration (pylint, isort)
-├── .gitignore
-└── docs/                 # Sample documents
+└── .gitignore
 ```
-

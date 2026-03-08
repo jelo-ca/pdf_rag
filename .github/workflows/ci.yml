@@ -29,10 +29,10 @@ jobs:
         run: pip install isort pylint pymupdf python-dotenv
 
       - name: isort – check import order
-        run: isort --check-only --diff rag_pipeline.py
+        run: isort --check-only --diff src/
 
       - name: pylint
-        run: pylint rag_pipeline.py
+        run: pylint src/
 
   # ── Tests ──────────────────────────────────────────────────────────────────
   test:
