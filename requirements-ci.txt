@@ -1,0 +1,16 @@
+# ── CI-only requirements ──────────────────────────────────────────────────────
+# Heavy ML dependencies (torch, llama-index, llama-cpp-python,
+# sentence-transformers) are NOT installed in CI.
+# tests/conftest.py injects MagicMock stubs for them automatically.
+
+# Direct runtime imports that are lightweight enough to install normally
+pymupdf>=1.27.1
+python-dotenv>=1.2.2
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Linting (also used by the lint job)
+pylint>=3.0.0
+isort>=5.13.0
