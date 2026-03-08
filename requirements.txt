@@ -1,0 +1,33 @@
+# ── Runtime ───────────────────────────────────────────────────────────────────
+
+# PDF extraction
+pymupdf>=1.27.1
+
+# LlamaIndex core + integrations
+llama-index>=0.14.15
+llama-index-core>=0.14.15
+llama-index-embeddings-huggingface>=0.6.1
+llama-index-retrievers-bm25>=0.6.5
+llama-index-llms-llama-cpp
+
+# Local LLM inference (Mistral GGUF)
+# GPU (CUDA): CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --force-reinstall
+# CPU only:   pip install llama-cpp-python
+llama-cpp-python
+
+# Embeddings
+sentence-transformers>=5.2.3
+huggingface-hub>=1.5.0
+torch>=2.10.0
+
+# UI
+gradio>=6.9.0
+nest-asyncio>=1.6.0
+
+# Environment variables
+python-dotenv>=1.2.2
+
+# ── Optional: OCR (scanned PDF support) ───────────────────────────────────────
+# Also requires the Tesseract binary: https://github.com/tesseract-ocr/tesseract
+pytesseract>=0.3.13
+pillow>=11.0.0

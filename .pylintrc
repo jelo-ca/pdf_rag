@@ -1,0 +1,71 @@
+[MASTER]
+# Use multiple processes to speed up analysis
+jobs = 1
+
+# Allow loading of arbitrary C extensions
+unsafe-load-any-extension = no
+
+[MESSAGES CONTROL]
+# Disable rules that are not applicable or overly strict for this project
+disable =
+    missing-module-docstring,
+    too-few-public-methods,
+    too-many-arguments,
+    too-many-instance-attributes,
+    fixme,
+    R0801,
+    R0917,
+    import-error
+
+[FORMAT]
+# Maximum line length (matches Black/common Python style guides)
+max-line-length = 120
+
+# Allow 4-space indentation after open parenthesis
+indent-after-paren = 4
+
+[BASIC]
+# Allow short names for loop variables, exceptions, and common abbreviations
+good-names = i, j, k, n, e, f, v, x, y, z, _
+
+# Naming conventions
+argument-naming-style = snake_case
+attr-naming-style = snake_case
+function-naming-style = snake_case
+method-naming-style = snake_case
+module-naming-style = snake_case
+variable-naming-style = snake_case
+class-naming-style = PascalCase
+const-naming-style = UPPER_CASE
+
+# Minimum docstring length before linting is applied
+docstring-min-length = 10
+
+[DESIGN]
+# Max number of local variables in a function
+max-locals = 20
+
+# Max number of branches (if/for/while) in a function
+max-branches = 15
+
+# Max number of public methods in a class
+max-public-methods = 20
+
+# Max number of attributes in a class
+max-attributes = 12
+
+[VARIABLES]
+# Dummy variable names that are allowed to be unused
+dummy-variables-rgx = ^(_+|(_[a-zA-Z0-9_]*[a-zA-Z0-9]+_)|dummy|unused)$
+
+[SIMILARITIES]
+# Minimum lines of a similarity (duplicate code detection)
+min-similarity-lines = 10
+
+[TYPECHECK]
+# Ignore missing members for these modules (common with C extensions / stubs)
+ignored-modules = fitz, llama_index, llama_cpp, pytesseract
+
+[LOGGING]
+# Format string used for logging calls — enforce lazy % formatting
+logging-format-style = old

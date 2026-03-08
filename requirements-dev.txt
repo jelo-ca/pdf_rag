@@ -1,0 +1,14 @@
+# ── Development dependencies ──────────────────────────────────────────────────
+# Install with: pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# Linting
+pylint>=3.0.0
+
+# Import sorting
+isort>=5.13.0
+
+# Jupyter
+jupyter>=1.1.0
+ipywidgets>=8.0.0
