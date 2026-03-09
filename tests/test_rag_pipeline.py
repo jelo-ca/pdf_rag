@@ -258,6 +258,21 @@ class TestLoadPdf:
         assert len(docs) == 1
         assert docs[0].metadata["ocr_used"] is False
 
+    def test_no_ocr_when_tesseract_binary_missing(self, pipeline, tmp_path):
+        """If pytesseract imports but no tesseract binary exists, OCR is skipped safely."""
+        sparse_page = self._page("hi")
+        mock_doc = self._mock_doc([sparse_page])
+
+        with patch("rag.pipeline.fitz.open", return_value=mock_doc), \
+             patch("rag.pipeline._OCR_AVAILABLE", True), \
+             patch("rag.pipeline._is_ocr_runtime_available", return_value=False), \
+             patch.object(pipeline, "_ocr_page") as mock_ocr:
+            docs = pipeline.load_pdf(str(tmp_path / "scan.pdf"))
+
+        mock_ocr.assert_not_called()
+        assert len(docs) == 1
+        assert docs[0].metadata["ocr_used"] is False
+
     def test_ocr_page_yields_empty_string_is_skipped(self, pipeline, tmp_path):
         """If OCR returns blank text the page is discarded."""
         sparse_page = self._page("hi")

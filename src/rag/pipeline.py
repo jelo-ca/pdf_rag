@@ -40,6 +40,69 @@ try:
 except ImportError:
     _OCR_AVAILABLE = False
 
+
+def _resolve_tesseract_cmd() -> Optional[str]:
+    """Resolve a runnable Tesseract executable path.
+
+    Returns:
+        Absolute path to the executable when one can be found, otherwise ``None``.
+    """
+    if not _OCR_AVAILABLE:
+        return None
+
+    # Respect explicit override if user already provided one.
+    configured_cmd = str(getattr(pytesseract.pytesseract, "tesseract_cmd", "") or "").strip()
+    if configured_cmd:
+        if os.path.isabs(configured_cmd) and os.path.exists(configured_cmd):
+            return configured_cmd
+        found_cmd = shutil.which(configured_cmd)
+        if found_cmd:
+            return found_cmd
+
+    # Standard PATH lookup.
+    found_on_path = shutil.which("tesseract")
+    if found_on_path:
+        return found_on_path
+
+    if os.name != "nt":
+        return None
+
+    # Common Windows install locations.
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Tesseract-OCR", "tesseract.exe"),
+        os.path.join(
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+            "Tesseract-OCR",
+            "tesseract.exe",
+        ),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
+    ]
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    return None
+
+
+def _is_ocr_runtime_available() -> bool:
+    """Return True only when pytesseract and a Tesseract binary are usable."""
+    if not _OCR_AVAILABLE:
+        return False
+
+    resolved_cmd = _resolve_tesseract_cmd()
+    if not resolved_cmd:
+        return False
+
+    pytesseract.pytesseract.tesseract_cmd = resolved_cmd
+
+    # Populate TESSDATA_PREFIX for common Windows installs when unset.
+    tessdata_dir = os.path.join(os.path.dirname(resolved_cmd), "tessdata")
+    if os.name == "nt" and os.path.isdir(tessdata_dir) and not os.environ.get("TESSDATA_PREFIX"):
+        os.environ["TESSDATA_PREFIX"] = tessdata_dir
+
+    return True
+
 load_dotenv()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
@@ -291,6 +354,13 @@ class RAGPipeline:
         """
         documents: List[Document] = []
         file_name = os.path.basename(pdf_path)
+        ocr_enabled = _is_ocr_runtime_available()
+
+        if _OCR_AVAILABLE and not ocr_enabled:
+            logger.warning(
+                "pytesseract is installed but no Tesseract binary was found. "
+                "Install Tesseract OCR or add it to PATH to enable scanned-page OCR."
+            )
 
         with fitz.open(pdf_path) as doc:
             # First pass: extract text and identify pages needing OCR
@@ -300,7 +370,7 @@ class RAGPipeline:
                 page_data.append((i, page, text))
 
             # Parallel OCR processing for scanned pages
-            if _OCR_AVAILABLE:
+            if ocr_enabled:
                 pages_needing_ocr = [
                     (i, page) for i, page, text in page_data if len(text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD
                 ]
@@ -650,6 +720,11 @@ class RAGPipeline:
             documents = self.load_pdf(pdf_path)
             if classify_docs:
                 documents = self._annotate_pharma_doc_types(documents)
+                before = len(documents)
+                documents = [d for d in documents if d.metadata.get("pharma_doc_type") != "unknown"]
+                dropped = before - len(documents)
+                if dropped:
+                    logger.info("Skipping %d page(s) classified as 'unknown'.", dropped)
             self._docs_classified = classify_docs
             self._chunks = self._chunk(documents)
             self._vector_index = self._index(self._chunks)
@@ -708,6 +783,11 @@ class RAGPipeline:
         # Classify all documents together if requested
         if classify_docs:
             all_documents = self._annotate_pharma_doc_types(all_documents)
+            before = len(all_documents)
+            all_documents = [d for d in all_documents if d.metadata.get("pharma_doc_type") != "unknown"]
+            dropped = before - len(all_documents)
+            if dropped:
+                logger.info("Skipping %d page(s) classified as 'unknown'.", dropped)
         self._docs_classified = classify_docs
 
         # Chunk and index all documents
@@ -780,6 +860,77 @@ class RAGPipeline:
             "doc_type_counts": doc_type_counts,
             "classified": self._docs_classified,
         }
+
+    def get_document_details(self) -> List[Dict[str, Any]]:
+        """Return per-file metadata for every indexed document.
+
+        Aggregates chunk-level metadata into one summary record per source file,
+        suitable for display in a UI document panel.
+
+        Returns:
+            A list of dicts sorted by filename, each containing:
+
+            - ``file_name`` (*str*) – Base filename.
+            - ``total_pages`` (*int*) – Number of unique pages indexed.
+            - ``total_chunks`` (*int*) – Number of chunks from this file.
+            - ``has_ocr`` (*bool*) – ``True`` if any page was OCR-processed.
+            - ``scan_ratio`` (*float*) – Fraction of pages that are scanned (0–1).
+            - ``pharma_doc_types`` (*dict*) – Mapping of pharma category → page count.
+              Empty when documents were not classified.
+
+        Raises:
+            RuntimeError: If :meth:`build` has not been called yet.
+        """
+        if not self._chunks:
+            raise RuntimeError("Pipeline not built. Call build() first.")
+
+        file_data: Dict[str, Dict[str, Any]] = {}
+
+        for chunk in self._chunks:
+            meta = chunk.metadata
+            fname = meta.get("file_name", "unknown")
+            page = meta.get("page_number")
+            ocr_used = meta.get("ocr_used", False)
+            doc_type = meta.get("doc_type", "digital")
+            pharma_type = meta.get("pharma_doc_type")
+
+            if fname not in file_data:
+                file_data[fname] = {
+                    "file_name": fname,
+                    "pages": set(),
+                    "scanned_pages": set(),
+                    "total_chunks": 0,
+                    "has_ocr": False,
+                    "pharma_page_types": {},
+                }
+
+            fd = file_data[fname]
+            fd["total_chunks"] += 1
+            if page is not None:
+                fd["pages"].add(page)
+                if ocr_used or doc_type == "scanned":
+                    fd["scanned_pages"].add(page)
+            if ocr_used:
+                fd["has_ocr"] = True
+            if pharma_type and page is not None:
+                fd["pharma_page_types"].setdefault(pharma_type, set()).add(page)
+
+        result = []
+        for fname, fd in sorted(file_data.items()):
+            total_pages = len(fd["pages"])
+            scanned = len(fd["scanned_pages"])
+            result.append(
+                {
+                    "file_name": fname,
+                    "total_pages": total_pages,
+                    "total_chunks": fd["total_chunks"],
+                    "has_ocr": fd["has_ocr"],
+                    "scan_ratio": round(scanned / total_pages, 2) if total_pages else 0.0,
+                    "pharma_doc_types": {k: len(v) for k, v in fd["pharma_page_types"].items()},
+                }
+            )
+
+        return result
 
     def expand_query(self, query: str, num_expansions: int = 3) -> List[str]:
         """Generate alternative phrasings of a query using the LLM.
