@@ -52,7 +52,7 @@ def _resolve_tesseract_cmd() -> Optional[str]:
         Absolute path to the executable when one can be found, otherwise ``None``.
     """
     resolved_cmd: Optional[str] = None
-    if _OCR_AVAILABLE:
+    if _OCR_AVAILABLE and pytesseract is not None:
         # Respect explicit override if user already provided one.
         configured_cmd = str(getattr(pytesseract.pytesseract, "tesseract_cmd", "") or "").strip()
         if configured_cmd:
@@ -91,7 +91,7 @@ def _resolve_tesseract_cmd() -> Optional[str]:
 
 def _is_ocr_runtime_available() -> bool:
     """Return True only when pytesseract and a Tesseract binary are usable."""
-    if not _OCR_AVAILABLE:
+    if not _OCR_AVAILABLE or pytesseract is None:
         return False
 
     resolved_cmd = _resolve_tesseract_cmd()
@@ -332,6 +332,8 @@ class RAGPipeline:
         Returns:
             Raw text extracted from the page image by Tesseract.
         """
+        if pytesseract is None or PILImage is None:
+            return ""
         pix = page.get_pixmap(dpi=_OCR_DPI)
         img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
         return pytesseract.image_to_string(img)
