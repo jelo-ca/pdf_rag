@@ -4,11 +4,11 @@ RAG Pipeline
 Reusable RAG pipeline for document question-answering over PDFs.
 
 Architecture:
-    PDF → Load (PyMuPDF + OCR fallback) → Semantic Chunk → Embed & Index (FAISS)
+    PDF → Load (PyMuPDF + OCR fallback) → Fixed-size Chunk → Embed & Index (FAISS)
     → Hybrid Retrieve (Vector + BM25, reciprocal rerank) → Prompt → Local LLM → Answer
 
 Embedding Model : sentence-transformers/all-MiniLM-L6-v2
-Chunking        : Semantic chunking (LlamaIndex SemanticSplitterNodeParser)
+Chunking        : Fixed-size chunking (512 tokens, 50 overlap)
 Retrieval       : Hybrid – vector (FAISS) + BM25, fused via reciprocal rerank
 LLM             : Mistral GGUF (local, via llama-cpp-python)
 """
@@ -19,13 +19,13 @@ import logging
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import fitz  # PyMuPDF
 import torch
 from dotenv import load_dotenv
 from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex, load_index_from_storage
-from llama_index.core.node_parser import SemanticSplitterNodeParser
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import QueryFusionRetriever, VectorIndexRetriever
@@ -299,7 +299,7 @@ class RAGPipeline:
             model_path=_model_path,
             temperature=0.1,
             max_new_tokens=512,
-            context_window=4096,
+            context_window=8192,
             model_kwargs={"n_gpu_layers": _gpu_layers},
             verbose=False,
         )
@@ -312,8 +312,9 @@ class RAGPipeline:
         Settings.embed_model = self.embed_model
         Settings.llm = self.llm
 
-        self._splitter: SemanticSplitterNodeParser = SemanticSplitterNodeParser(
-            embed_model=self.embed_model,
+        self._splitter: SentenceSplitter = SentenceSplitter(
+            chunk_size=512,
+            chunk_overlap=50,
         )
 
         self.persist_dir: Optional[str] = persist_dir
@@ -323,6 +324,7 @@ class RAGPipeline:
         self._query_engine: Optional[RetrieverQueryEngine] = None
         self._pdf_path: Optional[str] = None
         self._docs_classified: bool = False
+        self._query_cache: Dict[tuple, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # PDF Loading
@@ -392,7 +394,7 @@ class RAGPipeline:
                 ]
 
                 if pages_needing_ocr:
-                    with ThreadPoolExecutor(max_workers=4) as executor:
+                    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as executor:
                         ocr_results = list(executor.map(lambda p: (p[0], self._ocr_page(p[1])), pages_needing_ocr))
                     ocr_dict = dict(ocr_results)
                 else:
@@ -434,9 +436,8 @@ class RAGPipeline:
     def _chunk(self, documents: List[Document]) -> List[Any]:
         """Split documents into fixed-size chunks with overlap.
 
-        Uses :class:`~llama_index.core.node_parser.SemanticSplitterNodeParser`
-        which groups sentences into chunks based on embedding similarity,
-        so chunk boundaries align with semantic topic shifts.
+        Uses :class:`~llama_index.core.node_parser.SentenceSplitter`
+        with a chunk size of 512 tokens and 50-token overlap.
 
         Args:
             documents: List of :class:`~llama_index.core.Document` objects
@@ -614,12 +615,58 @@ class RAGPipeline:
         response = self.llm.complete(prompt)
         return self._parse_category(response.text)
 
-    def _annotate_pharma_doc_types(self, documents: List[Document]) -> List[Document]:
-        """Add a ``pharma_doc_type`` metadata field to each document via LLM classification.
+    def _classify_documents_batch(self, page_texts: List[str], batch_size: int = 5) -> List[str]:
+        """Classify multiple pages with fewer LLM calls by batching.
 
-        Classifies each page individually so the LLM returns exactly one label
-        per call, avoiding the alignment errors that occur when parsing a
-        multi-label batch response.
+        Pages are grouped into batches of up to *batch_size*.  Each batch is
+        sent as a single LLM prompt that asks for one category per line.
+        ``_parse_category`` is applied to every output line so the existing
+        normalisation and fallback logic is preserved.
+
+        Args:
+            page_texts: Raw text for each page that needs LLM classification
+                (keyword pre-screening has already been applied).
+            batch_size: Maximum number of pages per LLM call.
+
+        Returns:
+            List of category strings, one per entry in *page_texts*.
+        """
+        categories_str = ", ".join(_PHARMA_DOC_CATEGORIES)
+        results: List[str] = []
+
+        for batch_start in range(0, len(page_texts), batch_size):
+            batch = page_texts[batch_start : batch_start + batch_size]
+            pages_block = ""
+            for i, text in enumerate(batch, 1):
+                snippet = text[:_DOC_CLASSIFY_PROMPT_CHARS]
+                pages_block += f"[Page {i}]\n{snippet}\n\n"
+
+            prompt = (
+                "You are an expert pharmaceutical document classifier.\n"
+                f"Classify each page below. Choose exactly one from: {categories_str}.\n"
+                "Respond with ONLY the category names, one per line, in the same order as the pages. "
+                "No extra text, no numbers, no explanations.\n\n"
+                "Examples:\n"
+                f"{_FEW_SHOT_EXAMPLES}"
+                f"{pages_block}"
+                "Categories (one per line):"
+            )
+            response = self.llm.complete(prompt)
+            lines = [ln.strip() for ln in response.text.strip().splitlines() if ln.strip()]
+
+            for idx in range(len(batch)):
+                raw = lines[idx] if idx < len(lines) else ""
+                results.append(self._parse_category(raw))
+
+        return results
+
+    def _annotate_pharma_doc_types(self, documents: List[Document]) -> List[Document]:
+        """Add a ``pharma_doc_type`` metadata field to each document.
+
+        Stage 1 applies keyword matching (no LLM) to every page.  Pages not
+        resolved by keywords are collected and classified in batches of 5 via a
+        single LLM call per batch, reducing total LLM calls from O(N) to
+        O(N_ambiguous / 5).
 
         Args:
             documents: Pages loaded by :meth:`load_pdf`.
@@ -628,10 +675,37 @@ class RAGPipeline:
             The same list with ``pharma_doc_type`` set on every document's metadata.
         """
         logger.info("Classifying %d pages into pharma doc types...", len(documents))
-        for doc in documents:
-            doc_type = self._classify_document(doc.text)
-            doc.metadata["pharma_doc_type"] = doc_type
-            logger.debug("Page %d → %s", doc.metadata.get("page_number", "?"), doc_type)
+
+        # Stage 1: keyword scan on all pages (no LLM)
+        needs_llm: List[int] = []
+        for i, doc in enumerate(documents):
+            header = doc.text[:300].lower()
+            matched = next(
+                (cat for cat, kws in _KEYWORD_MAP.items() if any(kw in header for kw in kws)),
+                None,
+            )
+            if matched:
+                doc.metadata["pharma_doc_type"] = matched
+            else:
+                needs_llm.append(i)
+
+        # Stage 2: batch LLM classification for pages not resolved by keywords
+        if needs_llm:
+            logger.info(
+                "Keyword matched %d pages; sending %d to LLM in batches.",
+                len(documents) - len(needs_llm),
+                len(needs_llm),
+            )
+            texts = [documents[i].text for i in needs_llm]
+            llm_labels = self._classify_documents_batch(texts)
+            for doc_idx, label in zip(needs_llm, llm_labels):
+                documents[doc_idx].metadata["pharma_doc_type"] = label
+                logger.debug(
+                    "Page %d → %s",
+                    documents[doc_idx].metadata.get("page_number", "?"),
+                    label,
+                )
+
         logger.info("Document classification complete.")
         return documents
 
@@ -752,6 +826,7 @@ class RAGPipeline:
             llm=self.llm,
             text_qa_template=_PHARMA_QA_PROMPT,
         )
+        self.clear_cache()
         logger.info("RAG pipeline ready.")
 
     def build_from_multiple_pdfs(
@@ -820,8 +895,12 @@ class RAGPipeline:
 
         # Store list of PDF paths for stats
         self._pdf_path = f"Multiple files ({len(pdf_paths)} PDFs)"
-
+        self.clear_cache()
         logger.info("RAG pipeline ready with %d documents.", len(pdf_paths))
+
+    def clear_cache(self) -> None:
+        """Clear the query result cache."""
+        self._query_cache.clear()
 
     def get_stats(self) -> Dict[str, Any]:
         """Return statistics about the currently indexed document(s).
@@ -1068,6 +1147,11 @@ class RAGPipeline:
         if self._query_engine is None:
             raise RuntimeError("Pipeline not built. Call build(pdf_path) first.")
 
+        cache_key = (question, expand, num_expansions, classify, self.similarity_top_k)
+        if cache_key in self._query_cache:
+            logger.debug("Cache hit for query: %s", question)
+            return self._query_cache[cache_key]
+
         search_query = question
         if expand:
             queries = self.expand_query(question, num_expansions=num_expansions)
@@ -1103,9 +1187,115 @@ class RAGPipeline:
                 }
             )
 
-        return {
+        result = {
             "answer": str(response),
             "sources": sources,
             "chunk_count": len(sources),
             "query_category": query_category,
         }
+        self._query_cache[cache_key] = result
+        return result
+
+    def stream_query_with_sources(
+        self,
+        question: str,
+        expand: bool = False,
+        num_expansions: int = 3,
+        classify: bool = False,
+    ) -> "Iterator[Dict[str, Any]]":
+        """Stream the LLM answer token-by-token while returning sources up front.
+
+        Yields one dict per token with ``{"token": str, "sources": None}`` during
+        streaming, then a final dict with ``{"token": None, "sources": list,
+        "chunk_count": int, "query_category": str | None}`` when generation
+        finishes.
+
+        Retrieval (hybrid vector + BM25) and optional classification / expansion
+        run synchronously before streaming begins, so sources are always
+        available by the first ``yield``.
+
+        Args:
+            question: Natural-language question to answer.
+            expand: Generate query expansions before retrieval.
+            num_expansions: Number of expansions when ``expand=True``.
+            classify: Classify the query into a pharma category for filtered retrieval.
+
+        Yields:
+            Dicts as described above.
+
+        Raises:
+            RuntimeError: If :meth:`build` has not been called yet.
+        """
+        if self._query_engine is None:
+            raise RuntimeError("Pipeline not built. Call build(pdf_path) first.")
+
+        search_query = question
+        if expand:
+            queries = self.expand_query(question, num_expansions=num_expansions)
+            search_query = queries[1] if len(queries) > 1 else question
+
+        query_category: Optional[str] = None
+        if classify:
+            query_category = self._classify_query(search_query)
+
+        # Retrieve chunks without running the LLM answer step
+        retriever = (
+            self._build_filtered_engine(query_category).retriever
+            if classify and self._docs_classified and query_category and query_category != "unknown"
+            else self._query_engine.retriever
+        )
+        source_nodes = retriever.retrieve(search_query)
+
+        raw_scores = [n.score for n in source_nodes if n.score is not None]
+        max_score = max(raw_scores) if raw_scores else 0.0
+
+        sources: List[Dict[str, Any]] = []
+        context_parts: List[str] = []
+        for rank, node in enumerate(source_nodes):
+            meta = node.node.metadata
+            confidence = (
+                round((node.score / max_score) * 100, 1) if max_score > 0 and node.score is not None
+                else round(100.0 / (rank + 1), 1)
+            )
+            sources.append(
+                {
+                    "text": node.node.text,
+                    "file": meta.get("file_name", "unknown"),
+                    "page": meta.get("page_number", "?"),
+                    "score": confidence,
+                    "doc_type": meta.get("doc_type", "digital"),
+                    "pharma_doc_type": meta.get("pharma_doc_type", "unknown"),
+                }
+            )
+            context_parts.append(node.node.text)
+
+        context_str = "\n\n".join(context_parts)
+        prompt = _PHARMA_QA_PROMPT.format(context_str=context_str, query_str=search_query)
+
+        # Stream the answer — use cumulative chunk.text to avoid delta unreliability
+        prev_len = 0
+        last_chunk = None
+        for chunk in self.llm.stream_complete(prompt):
+            current_text = chunk.text or ""
+            token = current_text[prev_len:]
+            prev_len = len(current_text)
+            last_chunk = chunk
+            yield {"token": token, "sources": None}
+        full_answer = (last_chunk.text or "") if last_chunk else ""
+
+        # Final payload with sources and metadata
+        result = {
+            "token": None,
+            "answer": full_answer,
+            "sources": sources,
+            "chunk_count": len(sources),
+            "query_category": query_category,
+        }
+        cache_key = (question, expand, num_expansions, classify, self.similarity_top_k)
+        self._query_cache[cache_key] = {
+            "answer": full_answer,
+            "sources": sources,
+            "chunk_count": len(sources),
+            "query_category": query_category,
+        }
+        yield result

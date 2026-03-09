@@ -37,7 +37,7 @@ def pipeline(fake_model_path):
 
     with patch("rag.pipeline.LlamaCPP") as mock_llm_cls, \
          patch("rag.pipeline.HuggingFaceEmbedding") as mock_embed_cls, \
-         patch("rag.pipeline.SemanticSplitterNodeParser") as mock_splitter_cls, \
+         patch("rag.pipeline.SentenceSplitter") as mock_splitter_cls, \
          patch("rag.pipeline.Settings"):
 
         mock_llm_cls.return_value = MagicMock(name="llm")
@@ -90,7 +90,7 @@ class TestInit:
 
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.SentenceSplitter"), \
              patch("rag.pipeline.Settings"):
             with pytest.raises(FileNotFoundError, match="GGUF model not found"):
                 RAGPipeline(model_path="/nonexistent/path/model.gguf")
@@ -104,7 +104,7 @@ class TestInit:
 
         with patch("rag.pipeline.LlamaCPP") as mock_llm_cls, \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.SentenceSplitter"), \
              patch("rag.pipeline.Settings"):
             mock_llm_cls.return_value = MagicMock()
             RAGPipeline()  # no model_path arg
@@ -118,7 +118,7 @@ class TestInit:
 
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.SentenceSplitter"), \
              patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path)
 
@@ -129,7 +129,7 @@ class TestInit:
 
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.SentenceSplitter"), \
              patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path, similarity_top_k=10)
 
@@ -141,7 +141,7 @@ class TestInit:
         monkeypatch.setenv("SIMILARITY_TOP_K", "7")
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.SentenceSplitter"), \
              patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path)
 
@@ -153,7 +153,7 @@ class TestInit:
         monkeypatch.setenv("SIMILARITY_TOP_K", "99")
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.SentenceSplitter"), \
              patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path, similarity_top_k=3)
 
@@ -174,7 +174,7 @@ class TestInit:
 
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SemanticSplitterNodeParser"), \
+             patch("rag.pipeline.SentenceSplitter"), \
              patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path, num_queries=4)
 
@@ -824,45 +824,53 @@ class TestAnnotatePharmaDocTypes:
         from llama_index.core import Document
         return Document(text=text, metadata={"page_number": page, "file_name": "doc.pdf"})
 
-    def test_calls_classify_document_for_each_page(self, pipeline):
+    def test_sends_unmatched_pages_to_batch(self, pipeline):
+        # Texts with no keyword matches should all go to _classify_documents_batch
         docs = [self._make_doc(text=f"page {i}") for i in range(3)]
-        pipeline.llm.complete.return_value = MagicMock(text="cover_letter")
-        with patch.object(pipeline, "_classify_document", return_value="cover_letter") as mock_cls:
+        with patch.object(pipeline, "_classify_documents_batch", return_value=["cover_letter"] * 3) as mock_batch:
             pipeline._annotate_pharma_doc_types(docs)
-        assert mock_cls.call_count == 3
+        mock_batch.assert_called_once()
+        assert mock_batch.call_args[0][0] == ["page 0", "page 1", "page 2"]
+
+    def test_keyword_matched_pages_skip_batch(self, pipeline):
+        # A page whose header contains a keyword should not go to the LLM
+        docs = [self._make_doc(text="Certificate of Quality for batch 123")]
+        with patch.object(pipeline, "_classify_documents_batch") as mock_batch:
+            result = pipeline._annotate_pharma_doc_types(docs)
+        mock_batch.assert_not_called()
+        assert result[0].metadata["pharma_doc_type"] == "certificate_of_quality"
 
     def test_sets_pharma_doc_type_on_each_document(self, pipeline):
         docs = [self._make_doc(text=f"page {i}") for i in range(2)]
-        with patch.object(pipeline, "_classify_document", return_value="material_description"):
+        with patch.object(pipeline, "_classify_documents_batch", return_value=["material_description", "material_description"]):
             result = pipeline._annotate_pharma_doc_types(docs)
         for doc in result:
             assert doc.metadata["pharma_doc_type"] == "material_description"
 
     def test_returns_same_list_object(self, pipeline):
         docs = [self._make_doc()]
-        with patch.object(pipeline, "_classify_document", return_value="unknown"):
+        with patch.object(pipeline, "_classify_documents_batch", return_value=["unknown"]):
             result = pipeline._annotate_pharma_doc_types(docs)
         assert result is docs
 
     def test_preserves_existing_metadata(self, pipeline):
         docs = [self._make_doc(page=7)]
-        with patch.object(pipeline, "_classify_document", return_value="cover_letter"):
+        with patch.object(pipeline, "_classify_documents_batch", return_value=["cover_letter"]):
             result = pipeline._annotate_pharma_doc_types(docs)
         assert result[0].metadata["page_number"] == 7
         assert result[0].metadata["file_name"] == "doc.pdf"
 
     def test_per_page_category_can_differ(self, pipeline):
         docs = [self._make_doc(text="p1"), self._make_doc(text="p2")]
-        categories = ["cover_letter", "certificate_of_quality"]
-        with patch.object(pipeline, "_classify_document", side_effect=categories):
+        with patch.object(pipeline, "_classify_documents_batch", return_value=["cover_letter", "certificate_of_quality"]):
             result = pipeline._annotate_pharma_doc_types(docs)
         assert result[0].metadata["pharma_doc_type"] == "cover_letter"
         assert result[1].metadata["pharma_doc_type"] == "certificate_of_quality"
 
     def test_empty_list_returns_empty(self, pipeline):
-        with patch.object(pipeline, "_classify_document") as mock_cls:
+        with patch.object(pipeline, "_classify_documents_batch") as mock_batch:
             result = pipeline._annotate_pharma_doc_types([])
-        mock_cls.assert_not_called()
+        mock_batch.assert_not_called()
         assert result == []
 
 
