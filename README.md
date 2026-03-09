@@ -1,478 +1,220 @@
-# local-rag
+# Local RAG Pipeline
 
-A local, offline Retrieval-Augmented Generation (RAG) pipeline for querying PDF documents.
-Runs entirely on-device — no external API calls, no data leaves the machine.
+A local, offline Retrieval-Augmented Generation (RAG) pipeline for pharmaceutical PDF question answering.
 
----
+The project runs fully on-device with a local GGUF model through `llama-cpp-python`.
 
-## Project Structure
+## What This Program Does
 
-```
-RAG/
-├── src/
-│   └── rag/              # Main package
-│       ├── __init__.py   # Package exports
-│       ├── pipeline.py   # RAGPipeline implementation
-│       └── demos/        # Demo scripts
-│           └── multi_file.py
-├── tests/                # Test suite
-│   ├── conftest.py       # Test configuration
-│   └── test_rag_pipeline.py
-├── notebooks/            # Jupyter notebooks
-│   └── rag.ipynb         # Interactive demo
-├── docs/                 # Documentation
-├── storage/              # Persisted index data
-├── pyproject.toml        # Project configuration
-├── requirements.txt      # Production dependencies
-├── requirements-dev.txt  # Development dependencies
-└── README.md
-```
+This repository provides:
 
----
+- A reusable Python package (`src/rag`) with `RAGPipeline`
+- PDF ingestion via PyMuPDF with OCR fallback for scanned pages
+- Fixed-size text chunking (`SentenceSplitter`, chunk size 512, overlap 50)
+- Hybrid retrieval (vector + BM25) fused with reciprocal rerank
+- Optional pharma document/page classification and query-time classification
+- Single-file and multi-file PDF indexing
+- Query APIs with sources and confidence scoring
+- Streaming query responses with source metadata
+- Notebook-based Gradio UI demo (`notebooks/rag.ipynb`)
+- Unit tests for core pipeline behavior (`tests/test_rag_pipeline.py`)
+
+Out of scope for this repo:
+
+- Hosted production API/server deployment
+- Model training or fine-tuning workflows
 
 ## Architecture
 
-```
-PDF Input
-   │
-   ▼
-┌─────────────────────────────────────┐
-│  1. LOAD  (load_pdf)                │
-│  PyMuPDF → text per page            │
-│  Scanned page? → Tesseract OCR      │
-│  Output: List[Document] + metadata  │
-└──────────────┬──────────────────────┘
-               │
-               ▼  (optional — classify_docs=True)
-┌─────────────────────────────────────┐
-│  2. CLASSIFY  (_annotate_pharma_doc_types) │
-│  LLM classifies each page into one  │
-│  of 8 pharma doc categories         │
-│  Stored in pharma_doc_type metadata │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│  3. CHUNK  (_chunk)                 │
-│  SemanticSplitterNodeParser         │
-│  Splits by embedding similarity,    │
-│  not fixed token count              │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│  4. INDEX  (_index)                 │
-│  HuggingFace embeddings             │
-│  FAISS in-memory vector store       │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────────────────┐
-│  5. RETRIEVE  (_build_retriever)                    │
-│                                                     │
-│  ┌──────────────────┐   ┌──────────────────┐        │
-│  │  Vector Search   │   │  BM25 Search     │        │
-│  │  (FAISS / dense) │   │  (keyword/sparse)│        │
-│  └────────┬─────────┘   └────────┬─────────┘        │
-│           └──────────┬───────────┘                  │
-│                      ▼                              │
-│           Reciprocal Rank Fusion                    │
-│           (normalised re-ranking)                   │
-│                                                     │
-│  (optional — classify=True)                         │
-│  Query classified → filter chunks by pharma type    │
-└──────────────┬──────────────────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│  6. ANSWER  (query / query_with_sources)│
-│  Retrieved chunks → prompt          │
-│  Local Mistral 7B GGUF (llama.cpp)  │
-│  Output: answer + citations         │
-└─────────────────────────────────────┘
+```text
+PDF(s)
+  -> load_pdf (PyMuPDF)
+  -> optional OCR fallback for sparse/scanned pages (Tesseract)
+  -> optional pharma page classification (keyword + batched LLM)
+  -> chunking (SentenceSplitter)
+  -> indexing (VectorStoreIndex)
+  -> retrieval (VectorIndexRetriever + BM25Retriever + reciprocal rerank)
+  -> answer generation (local LlamaCPP GGUF model)
 ```
 
----
+## Tech Stack
 
-## Stack
+- LLM: local GGUF model via `llama-cpp-python`
+- Retrieval framework: `llama-index`
+- Embeddings: HuggingFace sentence-transformers
+- PDF parsing: `pymupdf`
+- OCR (optional): `pytesseract` + Tesseract binary + `pillow`
+- UI demo: `gradio` in notebook
 
-| Component      | Details                                                      |
-| -------------- | ------------------------------------------------------------ |
-| **LLM**        | Mistral 7B Instruct — local GGUF via `llama-cpp-python`      |
-| **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` (HuggingFace)       |
-| **Chunking**   | Semantic — LlamaIndex `SemanticSplitterNodeParser`           |
-| **Retrieval**  | Hybrid: FAISS vector + BM25, fused via reciprocal rerank     |
-| **OCR**        | Tesseract — automatic fallback for scanned/image-based pages |
-| **UI**         | Gradio                                                       |
+## Repository Layout
 
----
+```text
+RAG/
+  src/rag/
+    __init__.py
+    pipeline.py
+    demos/multi_file.py
+  tests/
+    conftest.py
+    test_rag_pipeline.py
+  notebooks/
+    rag.ipynb
+    storage/
+  docs/
+    *.pdf
+  storage/
+  requirements.txt
+  requirements-dev.txt
+  requirements-ci.txt
+  pyproject.toml
+  .env.example
+  README.md
+```
 
 ## Requirements
 
 - Python 3.10+
-- A local Mistral GGUF model file (e.g. `mistral-7b-instruct-v0.2.Q4_K_M.gguf`)
-- **GPU (recommended):** CUDA-capable GPU with CUDA 11.8+ and `nvidia-cuda-toolkit`
-- **CPU-only:** Works without a GPU; expect significantly slower inference
-
----
+- Local GGUF model file (configured with `MODEL_PATH`)
+- Optional GPU for faster inference (CPU-only supported)
+- Optional OCR runtime:
+  - Python packages: `pytesseract`, `pillow`
+  - Installed Tesseract executable discoverable on PATH (or standard Windows path)
 
 ## Installation
 
-### 1. Clone and create a virtual environment
-
 ```bash
-git clone <repo-url>
-cd RAG
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-```
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
 
-### 2. Install the package
-
-The project uses a professional `src-layout` structure. Install in editable mode for development:
-
-```bash
 pip install -e .
+# or: pip install -r requirements.txt
 ```
 
-Or install from requirements:
-
-```bash
-pip install -r requirements.txt
-```
-
-**GPU build of `llama-cpp-python` (CUDA):**
-
-```bash
-CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --force-reinstall
-```
-
-**CPU-only build:**
-
-```bash
-pip install llama-cpp-python
-```
-
-### 3. Install development dependencies (optional)
+Development dependencies:
 
 ```bash
 pip install -r requirements-dev.txt
 ```
 
-This includes pytest, black, isort, and pylint for testing and code quality.
+## Configuration
 
-### 4. Configure environment variables
+Copy `.env.example` to `.env` and set values as needed.
 
-```bash
-cp .env.example .env
-```
+Key variables:
 
-Edit `.env` with your values:
-
-```env
-MODEL_PATH=C:\LLM Models\Mistral\mistral-7b-instruct-v0.2.Q4_K_M.gguf
-N_GPU_LAYERS=-1
-EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
-SIMILARITY_TOP_K=5
-LOG_LEVEL=INFO
-```
-
-All variables have sensible defaults — only `MODEL_PATH` is required if your model is not at the default path.
-
-### 5. Download a GGUF model
-
-Download `mistral-7b-instruct-v0.2.Q4_K_M.gguf` from HuggingFace and save it locally.
-The default path expected by the pipeline is:
-
-```
-C:\LLM Models\Mistral\mistral-7b-instruct-v0.2.Q4_K_M.gguf
-```
-
-You can override this at initialisation — see [Configuration](#configuration).
-
----
+- `MODEL_PATH`
+- `N_GPU_LAYERS` (`-1` all layers on GPU, `0` CPU-only)
+- `EMBED_MODEL`
+- `SIMILARITY_TOP_K`
+- `LOG_LEVEL`
 
 ## Quick Start
 
-### Single File
-
-```python
-from rag import RAGPipeline
-
-# MODEL_PATH (and other settings) are read from .env automatically.
-# Pass arguments explicitly to override any env var.
-rag = RAGPipeline()                      # uses .env / defaults
-# rag = RAGPipeline(model_path="...")    # explicit override
-
-rag.build("path/to/document.pdf")
-
-answer = rag.query("What are the storage conditions?")
-print(answer)
-```
-
-### Multiple Files
-
-The pipeline now supports indexing multiple PDF files simultaneously into a unified searchable index:
+### Single PDF
 
 ```python
 from rag import RAGPipeline
 
 rag = RAGPipeline()
+rag.build("docs/Sample1.pdf", classify_docs=True)
 
-# Index multiple documents at once
+answer = rag.query("What are the storage conditions?", classify=True)
+print(answer)
+```
+
+### Multiple PDFs
+
+```python
+from rag import RAGPipeline
+
+rag = RAGPipeline(persist_dir="./storage")
+
 pdf_files = [
-    "certificate_of_analysis.pdf",
-    "material_specification.pdf",
-    "bse_tse_declaration.pdf"
+    "docs/Sample1.pdf",
+    "docs/Sample2.pdf",
+    "docs/Sample3.pdf",
 ]
 
-# Optional: Track progress
-def show_progress(current, total, filename):
-    print(f"Loading {current}/{total}: {filename}")
+rag.build_from_multiple_pdfs(pdf_files, classify_docs=True)
+result = rag.query_with_sources("Is there a BSE/TSE declaration?", classify=True)
 
-rag.build_from_multiple_pdfs(
-    pdf_files,
-    classify_docs=True,
-    progress_callback=show_progress
-)
-
-# Query across all indexed documents
-result = rag.query_with_sources("What is the BSE/TSE status?")
 print(result["answer"])
-for source in result["sources"]:
-    print(f"Source: {source['file']}, page {source['page']}")
+for s in result["sources"]:
+    print(s["file"], s["page"], s["score"])
 ```
 
----
+## Public API
 
-## API Reference
+Primary class: `rag.RAGPipeline`
 
-### `RAGPipeline`
+- `build(pdf_path, classify_docs=False)`
+- `build_from_multiple_pdfs(pdf_paths, classify_docs=False, progress_callback=None)`
+- `query(question, expand=False, num_expansions=3, classify=False)`
+- `query_with_sources(question, expand=False, num_expansions=3, classify=False)`
+- `stream_query_with_sources(question, expand=False, num_expansions=3, classify=False)`
+- `expand_query(query, num_expansions=3)`
+- `get_stats()`
+- `get_document_details()`
+- `clear_cache()`
 
-```python
-class RAGPipeline:
-    def __init__(
-        self,
-        model_path: str,
-        embed_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        similarity_top_k: int = 5,
-        num_queries: int = 1,
-        n_gpu_layers: int = -1,
-    ) -> None
-```
+`query_with_sources(...)` returns a dictionary containing:
 
-#### `build(pdf_path, classify_docs)`
+- `answer`: answer text
+- `sources`: chunk entries with `file`, `page`, `score`, `doc_type`, `pharma_doc_type`, and `text`
+- `chunk_count`: number of source chunks
+- `query_category`: query category when classification is enabled, else `None`
 
-```python
-rag.build(pdf_path: str, classify_docs: bool = False) -> None
-```
+## Pharma Classification Categories
 
-Runs the full ingestion pipeline on a PDF: load → (classify) → chunk → embed → index → build retriever.
-Call once per document. Calling again replaces the current index.
+- `cover_letter`
+- `certificate_of_quality`
+- `packaging_specification`
+- `bse_tse_declaration`
+- `material_description`
+- `supplier_qualification`
+- `chain_of_custody`
+- `unknown`
 
-When `classify_docs=True`, each page is passed to the LLM and labelled with one of
-eight pharmaceutical document categories (see [Classification](#classification)).
-This label is stored in the `pharma_doc_type` chunk metadata field and enables
-targeted retrieval when querying with `classify=True`. Adds one LLM call per page.
+When `classify_docs=True` at build time, retrieval can be category-filtered with `classify=True` during queries.
 
-#### `query(question, expand, num_expansions, classify)`
+## Notebook Demo
 
-```python
-rag.query(
-    question: str,
-    expand: bool = False,
-    num_expansions: int = 3,
-    classify: bool = False,
-) -> str
-```
+`notebooks/rag.ipynb` provides a Gradio interface for:
 
-Returns a plain-text answer with inline citations. Set `expand=True` to enable
-LLM-based query expansion before retrieval (improves recall, increases latency).
-Set `classify=True` to classify the query into a pharma document category and
-restrict retrieval to matching chunks (requires `classify_docs=True` at build time
-for chunk filtering; classification still runs otherwise).
+- Uploading one or more PDFs
+- Building the index
+- Asking questions
+- Viewing answer sources and index statistics
 
-#### `query_with_sources(question, expand, num_expansions, classify)`
+## Testing and Linting
 
-```python
-rag.query_with_sources(
-    question: str,
-    expand: bool = False,
-    num_expansions: int = 3,
-    classify: bool = False,
-) -> dict
-```
-
-Returns a structured result:
-
-```python
-{
-    "answer": str,           # LLM answer with inline citations
-    "sources": [             # Retrieved chunks
-        {
-            "text":           str,   # Full chunk text
-            "file":           str,   # Source filename
-            "page":           int,   # 1-based page number
-            "score":          float, # Confidence % relative to top chunk (0–100)
-            "doc_type":       str,   # "digital" or "scanned"
-            "pharma_doc_type": str,  # Pharma category label ("unknown" if not classified)
-        },
-        ...
-    ],
-    "chunk_count":    int,        # Number of chunks retrieved
-    "query_category": str | None, # Detected pharma category, or None if classify=False
-}
-```
-
-#### `expand_query(query, num_expansions)`
-
-```python
-rag.expand_query(query: str, num_expansions: int = 3) -> List[str]
-```
-
-Uses the LLM to generate alternative phrasings of a query. Returns the original
-query as the first element, followed by up to `num_expansions` alternatives.
-
----
-
-## Classification
-
-The pipeline can classify both documents and queries into one of eight pharmaceutical
-document categories using the local LLM:
-
-| Category                  | Description                             |
-| ------------------------- | --------------------------------------- |
-| `cover_letter`            | Accompanying cover letter               |
-| `certificate_of_quality`  | CoA / CoQ document                      |
-| `packaging_specification` | Packaging or labelling spec             |
-| `bse_tse_declaration`     | BSE/TSE risk declaration                |
-| `material_description`    | Raw material or ingredient description  |
-| `supplier_qualification`  | Vendor/supplier audit or approval       |
-| `chain_of_custody`        | Traceability or chain-of-custody record |
-| `unknown`                 | Could not be classified                 |
-
-### Document classification (at build time)
-
-```python
-rag.build("document.pdf", classify_docs=True)
-```
-
-Each page is sent to the LLM and labelled. The label is stored in the
-`pharma_doc_type` metadata field on every chunk derived from that page.
-
-### Query classification (at query time)
-
-```python
-answer = rag.query("What are the storage conditions?", classify=True)
-result = rag.query_with_sources("Who is the supplier?", classify=True)
-```
-
-The query is classified into a pharma category. If the index was built with
-`classify_docs=True`, retrieval is filtered to chunks whose `pharma_doc_type`
-matches the detected category. The detected category is returned as
-`result["query_category"]` in `query_with_sources`.
-
-> **Note:** Query classification works even without `classify_docs=True` — the LLM
-> still classifies the query, but no chunk filtering is applied because the metadata
-> is not present.
-
----
-
-## Configuration
-
-All parameters are set at initialisation:
-
-| Parameter          | Default            | Description                                                                       |
-| ------------------ | ------------------ | --------------------------------------------------------------------------------- |
-| `model_path`       | —                  | **Required.** Path to the local GGUF model file.                                  |
-| `embed_model_name` | `all-MiniLM-L6-v2` | HuggingFace embedding model.                                                      |
-| `similarity_top_k` | `5`                | Chunks returned per retriever before fusion.                                      |
-| `num_queries`      | `1`                | Query variants for `QueryFusionRetriever`. Set `>1` to enable internal expansion. |
-| `n_gpu_layers`     | `-1`               | GPU layers offloaded. `-1` = all (CUDA). `0` = CPU only.                          |
-
----
-
-## Notebook UI
-
-Open `rag.ipynb` in Jupyter and run all cells. A Gradio interface will launch at
-`http://localhost:7860` with:
-
-- **Upload panel** — drag-and-drop one or more PDFs (supports multiple file uploads), then click **Build Pipeline**
-  - **Classify document pages** checkbox — when enabled, each page is classified
-    by the LLM into a pharma document category before indexing (`classify_docs=True`)
-  - Multiple files are processed sequentially and indexed into a unified searchable collection
-  - Progress updates show which files have been loaded
-- **Chat** — type questions and receive answers with source citations from all indexed documents
-  - **Classify query** checkbox — when enabled, the query is classified and retrieval
-    is restricted to matching document-type chunks (`classify=True`)
-- **Sources panel** — per-chunk confidence scores, page references, source file names, and pharma
-  document type labels; shows the detected query category when classification is active
-- **Stats panel** — displays total files indexed, pages, chunks, and document type distribution
-
----
-
-## Linting
-
-Pylint is configured via [`.pylintrc`](.pylintrc) and [`pyproject.toml`](pyproject.toml).
+Run tests:
 
 ```bash
-pip install pylint
-pylint src/
+pytest
 ```
 
----
+Run linting:
+
+```bash
+pylint src
+```
 
 ## Troubleshooting
 
-**`FileNotFoundError: GGUF model not found`**
-The model path passed to `RAGPipeline` does not exist. Check the path and ensure
-the GGUF file has been downloaded.
+- `FileNotFoundError: GGUF model not found`
 
-**`ImportError: No module named 'pytesseract'` / OCR not available**
-OCR is optional. Install it to enable scanned-page support:
+  - Verify `MODEL_PATH` or pass `model_path=` explicitly.
 
-```bash
-pip install pytesseract pillow
-# Also install Tesseract binary: https://github.com/tesseract-ocr/tesseract
-```
+- OCR does not run for scanned pages
 
-Without it, scanned pages are silently skipped.
+  - Ensure Tesseract binary is installed and discoverable.
+  - Ensure `pytesseract` and `pillow` are installed.
 
-**CUDA out of memory**
-Reduce GPU offload: `RAGPipeline(..., n_gpu_layers=20)` to offload only 20 layers,
-or set `n_gpu_layers=0` for CPU-only inference.
+- `RuntimeError: Pipeline not built`
 
-**Slow inference on CPU**
-Use a more aggressively quantised model (e.g. `Q2_K` or `Q3_K_S`) or run on a
-machine with a CUDA GPU.
+  - Call `build(...)` or `build_from_multiple_pdfs(...)` before query methods.
 
-**`RuntimeError: Pipeline not built`**
-Call `rag.build("document.pdf")` before calling `query()` or `query_with_sources()`.
-
----
-
-## Project Structure
-
-```
-RAG/
-├── src/
-│   └── rag/              # Core RAGPipeline package
-│       ├── __init__.py
-│       ├── pipeline.py   # Core RAGPipeline class
-│       └── demos/
-│           └── multi_file.py
-├── tests/                # Test suite
-│   ├── conftest.py
-│   └── test_rag_pipeline.py
-├── notebooks/
-│   └── rag.ipynb         # Gradio UI notebook
-├── docs/                 # Sample documents
-├── storage/              # Persisted index data
-├── requirements.txt      # Runtime dependencies
-├── requirements-dev.txt  # Dev dependencies (pylint, jupyter, isort)
-├── .env.example          # Environment variable template
-├── .env                  # Your local config (gitignored)
-├── .pylintrc             # Pylint configuration
-├── pyproject.toml        # Tool configuration (pylint, isort)
-└── .gitignore
-```
+- Slow CPU performance
+  - Use GPU offload (`N_GPU_LAYERS`) or a smaller quantized GGUF model.
