@@ -123,8 +123,9 @@ logger = logging.getLogger(__name__)
 _PHARMA_QA_PROMPT = PromptTemplate(
     "You are a pharmaceutical document assistant. "
     "Answer the question based ONLY on the context provided below. "
-    "Keep the answer short and direct (1-3 sentences unless a list is explicitly requested). "
-    "Do not explain your reasoning, retrieval process, or broader context. "
+    "Be as brief as possible: 1-2 sentences maximum. "
+    "If a list is requested, use bullet points with no extra explanation. "
+    "Never add background, reasoning, or context beyond what directly answers the question. "
     "Do not include citations in the answer text.\n\n"
     "Context:\n{context_str}\n\n"
     "Question: {query_str}\n\n"
@@ -785,39 +786,60 @@ class RAGPipeline:
         """
         self._pdf_path = pdf_path
 
-        # Try to load existing index if persistence is enabled
+        # Load stored classification labels as reference only — never use stored
+        # text chunks for query answering; always re-read the source PDF.
+        stored_classifications: Dict[tuple, str] = {}
         if self.persist_dir and os.path.exists(self.persist_dir):
             try:
-                logger.info("Loading persisted index from %s...", self.persist_dir)
+                logger.info("Loading classification reference from %s...", self.persist_dir)
                 storage_context = StorageContext.from_defaults(persist_dir=self.persist_dir)
-                self._vector_index = load_index_from_storage(storage_context)
-                self._chunks = list(self._vector_index.docstore.docs.values())
-                loaded_classified = any("pharma_doc_type" in getattr(chunk, "metadata", {}) for chunk in self._chunks)
-                # If the caller wants classification but the persisted index was
-                # built without it, discard the cached index and rebuild.
-                if classify_docs and not loaded_classified:
-                    logger.info("Persisted index lacks classification data. Rebuilding with classification.")
-                    self._vector_index = None
-                else:
-                    self._docs_classified = loaded_classified
-                    logger.info("Loaded index with %d chunks.", len(self._chunks))
+                stored_index = load_index_from_storage(storage_context)
+                for chunk in stored_index.docstore.docs.values():
+                    meta = getattr(chunk, "metadata", {})
+                    file_name = meta.get("file_name")
+                    page = meta.get("page_number")
+                    doc_type = meta.get("pharma_doc_type")
+                    if file_name is not None and page is not None and doc_type:
+                        stored_classifications[(file_name, page)] = doc_type
+                logger.info(
+                    "Loaded classification reference for %d pages from storage.",
+                    len(stored_classifications),
+                )
             except (FileNotFoundError, OSError, ValueError, RuntimeError) as e:
-                logger.warning("Failed to load persisted index: %s. Building new index.", e)
-                self._vector_index = None
+                logger.warning("Failed to load stored classification data: %s.", e)
 
-        # Build new index if not loaded
-        if self._vector_index is None:
-            documents = self.load_pdf(pdf_path)
-            if classify_docs:
+        # Always re-read the PDF for fresh content used in query answering.
+        documents = self.load_pdf(pdf_path)
+        if classify_docs:
+            if stored_classifications:
+                # Apply stored labels where available; run LLM only for new pages.
+                needs_llm = []
+                for doc in documents:
+                    stored_type = stored_classifications.get(
+                        (doc.metadata.get("file_name"), doc.metadata.get("page_number"))
+                    )
+                    if stored_type:
+                        doc.metadata["pharma_doc_type"] = stored_type
+                    else:
+                        needs_llm.append(doc)
+                if needs_llm:
+                    logger.info(
+                        "Running LLM classification for %d new/unclassified pages.",
+                        len(needs_llm),
+                    )
+                    llm_labels = self._classify_documents_batch([d.text for d in needs_llm])
+                    for doc, label in zip(needs_llm, llm_labels):
+                        doc.metadata["pharma_doc_type"] = label
+            else:
                 documents = self._annotate_pharma_doc_types(documents)
-                before = len(documents)
-                documents = [d for d in documents if d.metadata.get("pharma_doc_type") != "unknown"]
-                dropped = before - len(documents)
-                if dropped:
-                    logger.info("Skipping %d page(s) classified as 'unknown'.", dropped)
-            self._docs_classified = classify_docs
-            self._chunks = self._chunk(documents)
-            self._vector_index = self._index(self._chunks)
+            before = len(documents)
+            documents = [d for d in documents if d.metadata.get("pharma_doc_type") != "unknown"]
+            dropped = before - len(documents)
+            if dropped:
+                logger.info("Skipping %d page(s) classified as 'unknown'.", dropped)
+        self._docs_classified = classify_docs
+        self._chunks = self._chunk(documents)
+        self._vector_index = self._index(self._chunks)
 
         hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
 
