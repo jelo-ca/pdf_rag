@@ -13,6 +13,8 @@ Retrieval       : Hybrid – vector (FAISS) + BM25, fused via reciprocal rerank
 LLM             : Mistral GGUF (local, via llama-cpp-python)
 """
 
+# pylint: disable=too-many-lines
+
 import logging
 import os
 import shutil
@@ -47,42 +49,42 @@ def _resolve_tesseract_cmd() -> Optional[str]:
     Returns:
         Absolute path to the executable when one can be found, otherwise ``None``.
     """
-    if not _OCR_AVAILABLE:
-        return None
+    resolved_cmd: Optional[str] = None
+    if _OCR_AVAILABLE:
+        # Respect explicit override if user already provided one.
+        configured_cmd = str(getattr(pytesseract.pytesseract, "tesseract_cmd", "") or "").strip()
+        if configured_cmd:
+            if os.path.isabs(configured_cmd) and os.path.exists(configured_cmd):
+                resolved_cmd = configured_cmd
+            else:
+                found_cmd = shutil.which(configured_cmd)
+                if found_cmd:
+                    resolved_cmd = found_cmd
 
-    # Respect explicit override if user already provided one.
-    configured_cmd = str(getattr(pytesseract.pytesseract, "tesseract_cmd", "") or "").strip()
-    if configured_cmd:
-        if os.path.isabs(configured_cmd) and os.path.exists(configured_cmd):
-            return configured_cmd
-        found_cmd = shutil.which(configured_cmd)
-        if found_cmd:
-            return found_cmd
+        # Standard PATH lookup.
+        if not resolved_cmd:
+            found_on_path = shutil.which("tesseract")
+            if found_on_path:
+                resolved_cmd = found_on_path
 
-    # Standard PATH lookup.
-    found_on_path = shutil.which("tesseract")
-    if found_on_path:
-        return found_on_path
+        if not resolved_cmd and os.name == "nt":
+            # Common Windows install locations.
+            candidates = [
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Tesseract-OCR", "tesseract.exe"),
+                os.path.join(
+                    os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                    "Tesseract-OCR",
+                    "tesseract.exe",
+                ),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
+            ]
 
-    if os.name != "nt":
-        return None
+            for candidate in candidates:
+                if candidate and os.path.exists(candidate):
+                    resolved_cmd = candidate
+                    break
 
-    # Common Windows install locations.
-    candidates = [
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Tesseract-OCR", "tesseract.exe"),
-        os.path.join(
-            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-            "Tesseract-OCR",
-            "tesseract.exe",
-        ),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
-    ]
-
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-
-    return None
+    return resolved_cmd
 
 
 def _is_ocr_runtime_available() -> bool:
