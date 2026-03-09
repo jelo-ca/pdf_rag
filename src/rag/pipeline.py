@@ -111,10 +111,12 @@ logger = logging.getLogger(__name__)
 _PHARMA_QA_PROMPT = PromptTemplate(
     "You are a pharmaceutical document assistant. "
     "Answer the question based ONLY on the context provided below. "
-    "After your answer, cite the specific source document name and page number(s) you referenced.\n\n"
+    "Keep the answer short and direct (1-3 sentences unless a list is explicitly requested). "
+    "Do not explain your reasoning, retrieval process, or broader context. "
+    "Do not include citations in the answer text.\n\n"
     "Context:\n{context_str}\n\n"
     "Question: {query_str}\n\n"
-    "Answer (with citations):"
+    "Answer:"
 )
 
 # Scanned page detection threshold: pages with fewer characters than this
@@ -981,8 +983,7 @@ class RAGPipeline:
                 not, classification still runs but no filtering is applied.
 
         Returns:
-            The LLM's answer as a plain string, including inline citations
-            to the source document and page number(s).
+            The LLM's answer as a plain string.
 
         Raises:
             RuntimeError: If :meth:`build` has not been called yet.
@@ -1032,7 +1033,7 @@ class RAGPipeline:
         Returns:
             A dictionary with the following keys:
 
-            - ``answer`` (*str*) – LLM-generated answer with inline citations.
+            - ``answer`` (*str*) – LLM-generated answer.
             - ``sources`` (*list[dict]*) – Retrieved chunks, each containing:
 
               - ``text`` – Raw chunk text (truncated in the UI, full here).
