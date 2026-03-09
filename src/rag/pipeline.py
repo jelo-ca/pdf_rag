@@ -40,6 +40,8 @@ try:
 
     _OCR_AVAILABLE = True
 except ImportError:
+    pytesseract = None  # type: ignore
+    PILImage = None  # type: ignore
     _OCR_AVAILABLE = False
 
 
