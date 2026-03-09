@@ -57,7 +57,7 @@ def _resolve_tesseract_cmd() -> Optional[str]:
         # return a dummy path to allow OCR flow to proceed (tests mock _ocr_page)
         if pytesseract is None:
             return "tesseract"
-        
+
         # Respect explicit override if user already provided one.
         configured_cmd = str(getattr(pytesseract.pytesseract, "tesseract_cmd", "") or "").strip()
         if configured_cmd:
