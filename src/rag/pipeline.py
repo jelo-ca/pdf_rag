@@ -765,7 +765,7 @@ class RAGPipeline:
     # Public API
     # ------------------------------------------------------------------
 
-    def build(self, pdf_path: str, classify_docs: bool = False) -> None:
+    def build(self, pdf_path: str, classify_docs: bool = False) -> None:  # pylint: disable=too-many-locals
         """Index a PDF document and prepare the query engine.
 
         This method runs the full ingestion pipeline:
@@ -1218,7 +1218,7 @@ class RAGPipeline:
         self._query_cache[cache_key] = result
         return result
 
-    def stream_query_with_sources(
+    def stream_query_with_sources(  # pylint: disable=too-many-locals
         self,
         question: str,
         expand: bool = False,
