@@ -9,7 +9,7 @@ This module provides a lightweight harness that:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -94,14 +94,14 @@ class RAGRegressionHarness:
         rows: List[Dict[str, Any]] = []
 
         for _, test in test_suite.iterrows():
-            started = datetime.now(UTC)
+            started = datetime.now(timezone.utc)
             payload = self.rag.query_with_sources(
                 test["query"],
                 classify=bool(test["classify"]),
                 expand=bool(test["expand"]),
                 num_expansions=int(test["num_expansions"]),
             )
-            ended = datetime.now(UTC)
+            ended = datetime.now(timezone.utc)
 
             answer = str(payload.get("answer", ""))
             sources = payload.get("sources", []) or []
