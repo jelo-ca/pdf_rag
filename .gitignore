@@ -42,7 +42,7 @@ MANIFEST
 Thumbs.db
 
 # Sample / sensitive documents — avoid accidental commit of proprietary PDFs
-docs/*.pdf
+docs/*
 notebooks/storage/*json
 
 # Testing

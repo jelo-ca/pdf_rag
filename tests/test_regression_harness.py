@@ -1,4 +1,9 @@
-"""Tests for pandas-based regression harness."""
+"""Tests for pandas-based regression harness.
+
+The FakeRAG stub is seeded with deterministic responses for all 5 documents in
+docs/ so that `test_run_generates_pass_fail_metrics` validates the complete
+multi-document test suite without hitting the real pipeline.
+"""
 
 from __future__ import annotations
 
@@ -30,6 +35,187 @@ class FakeRAG:
         return self.responses[question]
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _src(file: str, page: int, score: float = 90.0) -> Dict[str, Any]:
+    return {"score": score, "file": file, "page": page}
+
+
+# ---------------------------------------------------------------------------
+# Shared FakeRAG responses for the full multi-document suite
+# ---------------------------------------------------------------------------
+
+MULTI_DOC_RESPONSES: Dict[str, Dict[str, Any]] = {
+    # ---- test_1.pdf  (COVID-19 Vaccine SDS) --------------------------------
+    "What is the product name and product code for the COVID-19 vaccine?": {
+        "answer": "The product name is Pfizer-BioNTech COVID-19 Vaccine (Comirnaty) with product code PF00092.",
+        "query_category": None,
+        "sources": [_src("test_1.pdf", 1, 95.0)],
+    },
+    "What are the storage conditions for the COVID-19 vaccine product?": {
+        "answer": "Store as directed by product packaging.",
+        "query_category": None,
+        "sources": [_src("test_1.pdf", 5, 88.0)],
+    },
+    "What fire extinguishing media should be used for the COVID-19 vaccine?": {
+        "answer": "Use dry chemical, CO2, alcohol-resistant foam or water spray.",
+        "query_category": None,
+        "sources": [_src("test_1.pdf", 4, 85.0)],
+    },
+    "Is the COVID-19 vaccine regulated for transport under DOT or IATA?": {
+        "answer": "The product is not regulated for transport under USDOT, EUADR, IATA, or IMDG regulations.",
+        "query_category": None,
+        "sources": [_src("test_1.pdf", 11, 90.0)],
+    },
+    "What is the chemical family or formulation type of the COVID-19 vaccine?": {
+        "answer": "The COVID-19 vaccine uses a lipid nanoparticle (LNP) formulation to deliver mRNA.",
+        "query_category": None,
+        "sources": [_src("test_1.pdf", 3, 88.0)],
+    },
+    "What is the batch number or lot number of the COVID-19 vaccine?": {
+        # Hallucination-resistance: SDS contains no batch/lot number.
+        "answer": "There is no batch number or lot number mentioned in this Safety Data Sheet.",
+        "query_category": None,
+        "sources": [],
+    },
+
+    # ---- test_2.pdf  (Paracetamol Infusion SDS) ----------------------------
+    "What is the product name and product code for the paracetamol infusion?": {
+        "answer": "The product name is Paracetamol Solution for Infusion (Perfalgan) with product code PZ02462.",
+        "query_category": None,
+        "sources": [_src("test_2.pdf", 1, 93.0)],
+    },
+    "What is the intended use or therapeutic category of the paracetamol product?": {
+        "answer": "Paracetamol is used as an analgesic and antipyretic for treatment of pain and fever.",
+        "query_category": None,
+        "sources": [_src("test_2.pdf", 1, 90.0)],
+    },
+    "What is the CAS number of the active ingredient in the paracetamol infusion?": {
+        "answer": "The CAS number of paracetamol (acetaminophen) is 103-90-2.",
+        "query_category": None,
+        "sources": [_src("test_2.pdf", 3, 88.0)],
+    },
+    "What is the molecular formula of paracetamol?": {
+        "answer": "The molecular formula of paracetamol is C8H9NO2 with a molecular weight of 151.2.",
+        "query_category": None,
+        "sources": [_src("test_2.pdf", 9, 87.0)],
+    },
+    "What are the clinical effects of a paracetamol overdose?": {
+        "answer": "Overdose can cause severe hepatic (liver) toxicity and liver failure.",
+        "query_category": None,
+        "sources": [_src("test_2.pdf", 11, 91.0)],
+    },
+    "What is the batch number or lot number of the paracetamol infusion?": {
+        # Hallucination-resistance: SDS contains no batch/lot number.
+        "answer": "The Safety Data Sheet does not provide a batch number or lot number.",
+        "query_category": None,
+        "sources": [],
+    },
+
+    # ---- test_3.pdf  (Zoledronic Acid SDS) ---------------------------------
+    "What is the product name and chemical family of the zoledronic acid product?": {
+        "answer": "The product is Zoledronic Acid Injection (PZ01101), a bisphosphonate compound.",
+        "query_category": None,
+        "sources": [_src("test_3.pdf", 1, 94.0)],
+    },
+    "What hazard classification applies to the zoledronic acid product?": {
+        "answer": "Zoledronic acid is classified as reproductive toxic (H360FD — Danger).",
+        "query_category": None,
+        "sources": [_src("test_3.pdf", 2, 92.0)],
+    },
+    "What is the GHS signal word for zoledronic acid?": {
+        "answer": "The GHS signal word for zoledronic acid is Danger.",
+        "query_category": None,
+        "sources": [_src("test_3.pdf", 2, 90.0)],
+    },
+    "What is the pH of the zoledronic acid injection solution?": {
+        "answer": "The pH of the zoledronic acid injection solution is 6.2.",
+        "query_category": None,
+        "sources": [_src("test_3.pdf", 9, 88.0)],
+    },
+    "What is the Pfizer occupational exposure limit (OEL) for zoledronic acid?": {
+        "answer": "The Pfizer OEL for zoledronic acid is 4 µg/m3 as an inhalable dust.",
+        "query_category": None,
+        "sources": [_src("test_3.pdf", 8, 89.0)],
+    },
+    "Is zoledronic acid regulated for transport?": {
+        "answer": "Zoledronic acid is not regulated for transport under DOT, IATA, or IMDG.",
+        "query_category": None,
+        "sources": [_src("test_3.pdf", 14, 87.0)],
+    },
+
+    # ---- test_4.pdf  (Ciprofloxacin Injection SDS) -------------------------
+    "What is the product name and chemical family of the ciprofloxacin product?": {
+        "answer": "The product is Ciprofloxacin Injection (PZ01031), a fluoroquinolone antibiotic.",
+        "query_category": None,
+        "sources": [_src("test_4.pdf", 1, 93.0)],
+    },
+    "What is the recommended use or therapeutic category of ciprofloxacin injection?": {
+        "answer": "Ciprofloxacin is a broad-spectrum antibiotic used to treat bacterial infections.",
+        "query_category": None,
+        "sources": [_src("test_4.pdf", 1, 91.0)],
+    },
+    "What is the pH range of the ciprofloxacin injection solution?": {
+        "answer": "The pH of the ciprofloxacin injection solution ranges from 3.3 to 3.9.",
+        "query_category": None,
+        "sources": [_src("test_4.pdf", 9, 88.0)],
+    },
+    "What is the Pfizer occupational exposure limit for ciprofloxacin?": {
+        "answer": "The Pfizer OEL for ciprofloxacin is 600 µg/m3.",
+        "query_category": None,
+        "sources": [_src("test_4.pdf", 8, 90.0)],
+    },
+    "What aquatic environmental hazards are associated with ciprofloxacin?": {
+        "answer": "Ciprofloxacin is toxic to aquatic life (H401) and with long lasting effects (H411).",
+        "query_category": None,
+        "sources": [_src("test_4.pdf", 12, 87.0)],
+    },
+    "What are the known clinical effects of ciprofloxacin on tendons?": {
+        "answer": "Ciprofloxacin may cause tendonitis and tendon rupture, particularly the Achilles tendon.",
+        "query_category": None,
+        "sources": [_src("test_4.pdf", 11, 89.0)],
+    },
+
+    # ---- test_5.pdf  (Cytiva AKTA ready Flow Kit documents) ----------------
+    "What are the recommended storage and operating temperature conditions for the AKTA ready flow kit?": {
+        "answer": "Store at temperatures greater than +5°C. The kit can be used at temperatures between +2°C and +40°C.",
+        "query_category": None,
+        "sources": [_src("test_5.pdf", 1, 92.0)],
+    },
+    "What are the lot numbers for the AKTA ready High Flow and Low Flow kits?": {
+        "answer": "The lot number for the High Flow kit is 18356721 and for the Low Flow kit is 15102934.",
+        "query_category": None,
+        "sources": [_src("test_5.pdf", 1, 94.0)],
+    },
+    "Does the AKTA ready flow kit contain any materials of animal origin?": {
+        "answer": "No, the AKTA ready flow kit does not contain materials of animal origin. The BSE/TSE declaration confirms this.",
+        "query_category": None,
+        "sources": [_src("test_5.pdf", 2, 90.0)],
+    },
+    "What change was made to the blister packaging material for the AKTA ready kit?": {
+        "answer": "The blister packaging material was changed from PVC to PETG as documented in the packaging spec.",
+        "query_category": None,
+        "sources": [_src("test_5.pdf", 3, 88.0)],
+    },
+    "What quality certifications does the supplier Cytiva hold?": {
+        "answer": "Cytiva Sweden AB holds ISO 9001 and ISO 13485 quality management system certifications.",
+        "query_category": None,
+        "sources": [_src("test_5.pdf", 4, 89.0)],
+    },
+    "From which location or country did the AKTA ready kit shipment originate?": {
+        "answer": "The AKTA ready kit shipment originated from Eysins, Switzerland via Cytiva.",
+        "query_category": None,
+        "sources": [_src("test_5.pdf", 5, 87.0)],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
 def test_create_test_suite_applies_defaults() -> None:
     suite = RAGRegressionHarness.create_test_suite(
         [
@@ -44,101 +230,29 @@ def test_create_test_suite_applies_defaults() -> None:
 
 
 def test_run_generates_pass_fail_metrics() -> None:
-    # Responses mirror what the real pipeline returns for Sample1.pdf
-    # (Safety Data Sheet — Pfizer-BioNTech COVID-19 Vaccine).
-    # classify=False so query_category is None for all cases.
-    fake = FakeRAG(
-        responses={
-            "What is the product name and product code?": {
-                "answer": "The product name is Pfizer-BioNTech COVID-19 Vaccine (Comirnaty) with product code PF00092.",
-                "query_category": None,
-                "sources": [{"score": 95.0, "file": "Sample1.pdf", "page": 1}],
-            },
-            "What are the storage conditions for this product?": {
-                "answer": "Store as directed by product packaging.",
-                "query_category": None,
-                "sources": [{"score": 88.0, "file": "Sample1.pdf", "page": 5}],
-            },
-            "What fire extinguishing media should be used?": {
-                "answer": "Use dry chemical, CO2, alcohol-resistant foam or water spray.",
-                "query_category": None,
-                "sources": [{"score": 85.0, "file": "Sample1.pdf", "page": 4}],
-            },
-            "Is this product regulated for transport?": {
-                "answer": "The product is not regulated for transport under USDOT, EUADR, IATA, or IMDG regulations.",
-                "query_category": None,
-                "sources": [{"score": 90.0, "file": "Sample1.pdf", "page": 11}],
-            },
-            "What is the batch number or lot number?": {
-                # Correct pipeline behaviour: acknowledge absence rather than hallucinate.
-                "answer": "There is no batch number or lot number mentioned in this Safety Data Sheet.",
-                "query_category": None,
-                "sources": [],
-            },
-        }
-    )
-    harness = RAGRegressionHarness(fake)
+    """Full multi-document suite passes with deterministic FakeRAG responses."""
+    from scripts.run_regression import build_combined_suite
 
-    suite = RAGRegressionHarness.create_test_suite(
-        [
-            {
-                "test_id": "TC-001",
-                "query": "What is the product name and product code?",
-                "required_terms": "pfizer|comirnaty|covid|PF00092",
-                "min_sources": 1,
-                "classify": False,
-                "criticality": "high",
-            },
-            {
-                "test_id": "TC-002",
-                "query": "What are the storage conditions for this product?",
-                "required_terms": "store|directed|packaging",
-                "min_sources": 1,
-                "classify": False,
-                "criticality": "high",
-            },
-            {
-                "test_id": "TC-003",
-                "query": "What fire extinguishing media should be used?",
-                "required_terms": "CO2|chemical|foam|water",
-                "min_sources": 1,
-                "classify": False,
-                "criticality": "medium",
-            },
-            {
-                "test_id": "TC-004",
-                "query": "Is this product regulated for transport?",
-                "required_terms": "not regulated|not applicable",
-                "min_sources": 1,
-                "classify": False,
-                "criticality": "medium",
-            },
-            {
-                # Hallucination-resistance check — SDS has no batch/lot number.
-                "test_id": "TC-005",
-                "query": "What is the batch number or lot number?",
-                "required_terms": "no batch|not mentioned|not available|not provided|not provide|not specified|safety data",
-                "min_sources": 0,
-                "classify": False,
-                "criticality": "high",
-            },
-        ]
-    )
+    fake = FakeRAG(responses=MULTI_DOC_RESPONSES)
+    harness = RAGRegressionHarness(fake)
+    suite = RAGRegressionHarness.create_test_suite(build_combined_suite())
     results = harness.run(suite)
 
-    assert len(results) == 5
+    assert len(results) == len(build_combined_suite()), "Row count mismatch"
+
     for _, row in results.iterrows():
-        assert bool(row["has_min_sources"]) is True, f"{row['test_id']} missing sources"
-        assert bool(row["category_match"]) is True, f"{row['test_id']} category mismatch"
-        assert bool(row["required_terms_match"]) is True, f"{row['test_id']} required terms not found"
-        assert bool(row["passed"]) is True, f"{row['test_id']} unexpectedly failed"
+        tid = row["test_id"]
+        assert bool(row["has_min_sources"]) is True, f"{tid}: missing sources"
+        assert bool(row["category_match"]) is True, f"{tid}: category mismatch"
+        assert bool(row["required_terms_match"]) is True, f"{tid}: required terms not found in answer"
+        assert bool(row["passed"]) is True, f"{tid}: unexpectedly failed"
 
 
 def test_compare_to_baseline_flags_regression() -> None:
     current_results = pd.DataFrame(
         [
             {
-                "test_id": "TC-001",
+                "test_id": "T1-001",
                 "answer": "Completely different answer.",
                 "passed": False,
                 "avg_confidence": 45.0,
@@ -150,7 +264,7 @@ def test_compare_to_baseline_flags_regression() -> None:
     baseline_results = pd.DataFrame(
         [
             {
-                "test_id": "TC-001",
+                "test_id": "T1-001",
                 "answer": "Batch number is 12345.",
                 "passed": True,
                 "avg_confidence": 90.0,
@@ -203,13 +317,13 @@ def test_visualize_results_creates_png(tmp_path) -> None:
     results = pd.DataFrame(
         [
             {
-                "test_id": "TC-001",
+                "test_id": "T1-001",
                 "passed": True,
                 "response_time_ms": 850.0,
                 "avg_confidence": 88.0,
             },
             {
-                "test_id": "TC-002",
+                "test_id": "T1-002",
                 "passed": False,
                 "response_time_ms": 1320.0,
                 "avg_confidence": 54.0,
@@ -229,14 +343,14 @@ def test_visualize_comparison_creates_png(tmp_path) -> None:
     comparison = pd.DataFrame(
         [
             {
-                "test_id": "TC-001",
+                "test_id": "T1-001",
                 "answer_similarity": 0.92,
                 "confidence_delta": -2.0,
                 "response_time_delta_ms": 120.0,
                 "regression_detected": False,
             },
             {
-                "test_id": "TC-002",
+                "test_id": "T1-002",
                 "answer_similarity": 0.41,
                 "confidence_delta": -30.0,
                 "response_time_delta_ms": 3600.0,
