@@ -1,28 +1,21 @@
 """
-Embedding Classification Dynamics Test
-=======================================
-Measures how classification accuracy and response speed change as more
-documents are progressively added to a temporary embedding store.
+Pipeline Classification Dynamics Test
+======================================
+Wraps ``pipeline._classify_document`` (the real two-stage keyword + LLM
+classifier) to measure how accuracy, speed, and the keyword-hit vs.
+LLM-fallback ratio change as progressively more documents are classified
+and stored in a temporary embedding store.
 
-Key features
-------------
-* Temporary numpy-backed embedding store (no heavy ML deps required).
-* Deterministic synthetic embeddings per document type.
-* Accuracy and latency recorded after every batch of new documents.
-* Two output graphs:
-    1. Overall accuracy + speed vs. store size.
-    2. Per-category accuracy breakdown vs. store size.
-* Persistence round-trip: store survives serialisation to disk.
+Heavy ML dependencies are NOT needed — ``conftest.py`` stubs them out, and
+the LLM is replaced with a lightweight deterministic mock.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import tempfile
 import time
-from collections import Counter
 from pathlib import Path
 
 import matplotlib
@@ -31,171 +24,239 @@ import numpy as np
 import pandas as pd
 import pytest
 
-matplotlib.use("Agg")  # Non-interactive backend — safe for CI and headless runs.
+matplotlib.use("Agg")
+
+# ---------------------------------------------------------------------------
+# Pull in the real pipeline internals we are wrapping
+# ---------------------------------------------------------------------------
+from rag.pipeline import (  # noqa: E402
+    _KEYWORD_MAP,
+    _PHARMA_DOC_CATEGORIES,
+    RAGPipeline,
+)
+
+DOCUMENT_TYPES: list[str] = _PHARMA_DOC_CATEGORIES
+EMBEDDING_DIM: int = 384  # all-MiniLM-L6-v2 dimension
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Synthetic document corpus
 # ---------------------------------------------------------------------------
 
-DOCUMENT_TYPES: list[str] = [
-    "cover_letter",
-    "certificate_of_quality",
-    "packaging_specification",
-    "bse_tse_declaration",
-    "material_description",
-    "supplier_qualification",
-    "chain_of_custody",
-    "unknown",
-]
+# Documents whose headers contain keywords from _KEYWORD_MAP
+# -> should be resolved by the keyword fast-path (no LLM call)
+_KEYWORD_CORPUS: dict[str, list[str]] = {
+    "cover_letter": [
+        "Dear Supplier, please find enclosed the updated documentation for batch 2024-001.",
+        "We herewith enclose the quality documentation requested by your team.",
+        "Dear sir, herewith enclosed please find the shipment records.",
+    ],
+    "certificate_of_quality": [
+        "Certificate of Quality — Batch No: 12345 — Product: Excipient X — Conforms to spec.",
+        "Certificate of Analysis — sample id 9912 — all specifications met.",
+        "C.O.A — Batch 77201 — complies with EP monograph.",
+    ],
+    "packaging_specification": [
+        "Packaging Specification Rev. 3 — HDPE bottle 250 mL — closure torque 15 Nm.",
+        "Pack spec for blister PVC/PVDC — dimensions 100 x 80 mm.",
+        "Label specification V2 — printed black text on white background.",
+    ],
+    "bse_tse_declaration": [
+        "BSE/TSE Declaration — no materials of bovine or ovine origin are used.",
+        "Transmissible spongiform encephalopathy statement — raw materials: plant only.",
+        "Bovine spongiform encephalopathy risk assessment — not applicable.",
+    ],
+    "material_description": [
+        "Material Description — Chemical: Microcrystalline Cellulose — CAS 9004-34-6.",
+        "Product Description — Polysorbate 80 — function: emulsifier — grade: NF.",
+        "Substance Description — lactose monohydrate — particle size D90 < 150 um.",
+    ],
+    "supplier_qualification": [
+        "Supplier Qualification Report — audit date 2023-05 — status: Approved.",
+        "Vendor Qualification — site inspection score 94/100 — ISO 9001 certified.",
+        "Audit Report — Plant A — GMP compliant per EU Directive 2003/94/EC.",
+    ],
+    "chain_of_custody": [
+        "Chain of Custody — transferred from Manufacturer X to Distributor Y.",
+        "Chain-of-custody document — sample sealed, temperature logged.",
+        "Custody Transfer Record — batch 20240310 — cold chain maintained.",
+    ],
+    # "unknown" has no entries in _KEYWORD_MAP so these fall through to LLM
+    "unknown": [
+        "Internal memo — quarterly review meeting notes Q3 2024.",
+        "Project timeline — milestone tracking sheet — Phase 2.",
+        "Employee onboarding checklist — IT setup complete.",
+    ],
+}
 
-EMBEDDING_DIM: int = 384  # Matches sentence-transformers/all-MiniLM-L6-v2
+# Documents with no keyword signals -> fall through to LLM path
+_AMBIGUOUS_CORPUS: dict[str, list[str]] = {
+    "cover_letter": [
+        "Attached are the relevant documents for your review. Please acknowledge receipt.",
+        "Please find the requested files in this transmission. Contact us for queries.",
+    ],
+    "certificate_of_quality": [
+        "Batch 12345 tested against specification. All results within acceptance criteria.",
+        "Product lot 77201 released by QA department per internal procedure QP-04.",
+    ],
+    "packaging_specification": [
+        "Primary container dimensions verified against approved drawing PK-0023 Rev 2.",
+        "Blister configuration changed from PVC to PETG per change control CC-112.",
+    ],
+    "bse_tse_declaration": [
+        "No animal-derived raw materials are used in the manufacture of this product.",
+        "All excipients are of synthetic origin — no prion contamination risk identified.",
+    ],
+    "material_description": [
+        "Molecular weight: 342.30 g/mol. Solubility in water: 210 g/L at 25 degrees C.",
+        "Functional excipient used as a binder in solid oral dosage forms.",
+    ],
+    "supplier_qualification": [
+        "Site audit completed 2023-05. Findings: 0 critical, 2 minor. Status: Approved.",
+        "Quality agreement signed 2022-11. Next review due 2025-11. Status: active.",
+    ],
+    "chain_of_custody": [
+        "Sample sealed by QC inspector, transferred under continuous cold chain supervision.",
+        "Temperature logger attached. Min: 2.1C, Max: 7.9C during transit. No excursions.",
+    ],
+    "unknown": [
+        "Q3 budget allocation — R&D department — EUR 1.2M approved.",
+        "Canteen menu for week 42 — includes vegetarian and vegan options.",
+    ],
+}
 
 
 # ---------------------------------------------------------------------------
-# EmbeddingStore — temporary database for embedded documents
+# Mock LLM
 # ---------------------------------------------------------------------------
 
+class _LLMResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
 
-class EmbeddingStore:
+
+class MockLLM:
     """
-    Lightweight embedding store backed by numpy arrays on disk.
+    Returns the correct category for any document whose first 60 characters
+    appear as a key in *text_to_label*.  Counts every ``.complete()`` call
+    so tests can assert on LLM-path vs. keyword-path invocation counts.
+    """
 
-    Documents are added incrementally.  Classification uses cosine-similarity
-    search plus top-k majority voting, mirroring the FAISS + retrieval logic
-    in the production RAG pipeline.
+    def __init__(self, text_to_label: dict[str, str]) -> None:
+        self._map = text_to_label
+        self.call_count = 0
 
-    Parameters
-    ----------
-    store_dir : str
-        Path to an existing directory used for persistence.
-    embedding_dim : int
-        Dimensionality of the embedding vectors.
+    def complete(self, prompt: str) -> _LLMResponse:
+        self.call_count += 1
+        for snippet, label in self._map.items():
+            if snippet in prompt:
+                return _LLMResponse(label)
+        return _LLMResponse("unknown")
+
+
+def _build_llm_map() -> dict[str, str]:
+    """
+    Map first-60-char snippet -> label for every document that will reach
+    the LLM fallback path (ambiguous docs + "unknown" keyword docs which
+    have no keyword_map entry).
+    """
+    mapping: dict[str, str] = {}
+    for label, texts in _AMBIGUOUS_CORPUS.items():
+        for text in texts:
+            mapping[text[:60]] = label
+    for text in _KEYWORD_CORPUS.get("unknown", []):
+        mapping[text[:60]] = "unknown"
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# MinimalClassifier — thin shell that hosts the real pipeline methods
+# ---------------------------------------------------------------------------
+
+class MinimalClassifier:
+    """
+    Exposes ``_classify_document`` and ``_parse_category`` from the real
+    ``RAGPipeline`` class while substituting the LLM with a mock.
+
+    The unbound method call ``RAGPipeline._classify_document(self, text)``
+    uses Python's normal attribute lookup so ``self.llm`` and
+    ``self._parse_category`` are resolved against this class.
+    """
+
+    def __init__(self, llm: MockLLM) -> None:
+        self.llm = llm
+
+    def classify_document(self, text: str) -> str:
+        return RAGPipeline._classify_document(self, text)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _parse_category(text: str) -> str:
+        return RAGPipeline._parse_category(text)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# ClassificationStore — temporary database of classified + embedded docs
+# ---------------------------------------------------------------------------
+
+class ClassificationStore:
+    """
+    Accumulates classified documents together with synthetic embedding vectors.
+    Both artefacts are persisted to a temp directory after every ``add()`` call.
     """
 
     _EMBEDDINGS_FILE = "embeddings.npy"
-    _LABELS_FILE = "labels.json"
+    _META_FILE = "metadata.json"
 
-    def __init__(self, store_dir: str, embedding_dim: int) -> None:
+    def __init__(self, store_dir: str) -> None:
         self.store_dir = Path(store_dir)
-        self.embedding_dim = embedding_dim
         self._embeddings: list[np.ndarray] = []
-        self._labels: list[str] = []
+        self._metadata: list[dict] = []
 
-    # ------------------------------------------------------------------
-    # Mutation
-    # ------------------------------------------------------------------
-
-    def add(self, embedding: np.ndarray, label: str) -> None:
-        """Append a single embedding and persist the updated store to disk."""
+    def add(self, text: str, predicted: str, true_label: str, embedding: np.ndarray) -> None:
         self._embeddings.append(embedding.astype(np.float32))
-        self._labels.append(label)
+        self._metadata.append(
+            {
+                "text_snippet": text[:80],
+                "predicted": predicted,
+                "true": true_label,
+                "correct": predicted == true_label,
+            }
+        )
         self._persist()
-
-    def add_batch(self, embeddings: list[np.ndarray], labels: list[str]) -> None:
-        """Append multiple embeddings at once (single persist at the end)."""
-        for emb, lbl in zip(embeddings, labels):
-            self._embeddings.append(emb.astype(np.float32))
-            self._labels.append(lbl)
-        self._persist()
-
-    # ------------------------------------------------------------------
-    # Classification
-    # ------------------------------------------------------------------
-
-    def classify(self, query_embedding: np.ndarray, top_k: int = 3) -> str:
-        """
-        Return the predicted label for *query_embedding* using cosine similarity
-        and majority voting among the *top_k* nearest neighbours.
-        """
-        if not self._embeddings:
-            return "unknown"
-
-        matrix = np.array(self._embeddings, dtype=np.float32)
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        matrix_normed = matrix / np.where(norms == 0, 1.0, norms)
-
-        q = query_embedding.astype(np.float32)
-        q_norm = np.linalg.norm(q)
-        q_normed = q / (q_norm if q_norm > 0 else 1.0)
-
-        similarities = matrix_normed @ q_normed
-        k = min(top_k, len(self._embeddings))
-        top_indices = np.argpartition(similarities, -k)[-k:]
-        top_labels = [self._labels[i] for i in top_indices]
-        return Counter(top_labels).most_common(1)[0][0]
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
 
     def _persist(self) -> None:
         np.save(str(self.store_dir / self._EMBEDDINGS_FILE), np.array(self._embeddings, dtype=np.float32))
-        with open(self.store_dir / self._LABELS_FILE, "w", encoding="utf-8") as fh:
-            json.dump(self._labels, fh)
+        with open(self.store_dir / self._META_FILE, "w", encoding="utf-8") as fh:
+            json.dump(self._metadata, fh, indent=2)
 
-    @classmethod
-    def load(cls, store_dir: str, embedding_dim: int) -> "EmbeddingStore":
-        """Reconstruct an EmbeddingStore from a previously persisted directory."""
-        store = cls(store_dir, embedding_dim)
-        emb_path = Path(store_dir) / cls._EMBEDDINGS_FILE
-        lbl_path = Path(store_dir) / cls._LABELS_FILE
+    def accuracy(self) -> float:
+        if not self._metadata:
+            return 0.0
+        return sum(m["correct"] for m in self._metadata) / len(self._metadata) * 100
 
-        if emb_path.exists() and lbl_path.exists():
-            loaded = np.load(str(emb_path))
-            store._embeddings = [loaded[i] for i in range(len(loaded))]
-            with open(lbl_path, encoding="utf-8") as fh:
-                store._labels = json.load(fh)
-        return store
-
-    # ------------------------------------------------------------------
-    # Misc
-    # ------------------------------------------------------------------
+    def accuracy_for(self, doc_type: str) -> float:
+        subset = [m for m in self._metadata if m["true"] == doc_type]
+        if not subset:
+            return 0.0
+        return sum(m["correct"] for m in subset) / len(subset) * 100
 
     def __len__(self) -> int:
-        return len(self._embeddings)
-
-    @property
-    def size_bytes(self) -> int:
-        total = 0
-        for fname in (self._EMBEDDINGS_FILE, self._LABELS_FILE):
-            p = self.store_dir / fname
-            if p.exists():
-                total += p.stat().st_size
-        return total
+        return len(self._metadata)
 
 
 # ---------------------------------------------------------------------------
-# Synthetic embedding generation
+# Synthetic embeddings (centroid + Gaussian noise)
 # ---------------------------------------------------------------------------
 
-
-def _centroid_for_type(doc_type: str) -> np.ndarray:
-    """
-    Return a unit-norm centroid vector that is unique and deterministic for
-    *doc_type*.  The centroid acts as the "true" embedding for that class.
-    """
+def _centroid(doc_type: str) -> np.ndarray:
     seed = sum(i * ord(c) for i, c in enumerate(doc_type, 1))
-    rng = np.random.default_rng(seed)
-    centroid = rng.standard_normal(EMBEDDING_DIM).astype(np.float32)
-    return centroid / np.linalg.norm(centroid)
+    v = np.random.default_rng(seed).standard_normal(EMBEDDING_DIM).astype(np.float32)
+    return v / np.linalg.norm(v)
 
 
-def make_embeddings(rng: np.random.Generator, doc_type: str, count: int, noise: float = 0.1) -> list[np.ndarray]:
-    """
-    Return *count* synthetic embeddings for *doc_type*.
-
-    Each embedding = unit_centroid + gaussian noise * *noise*, then
-    re-normalised.  Smaller *noise* → tighter cluster → higher accuracy.
-    """
-    centroid = _centroid_for_type(doc_type)
-    embeddings: list[np.ndarray] = []
-    for _ in range(count):
-        noise_vec = rng.standard_normal(EMBEDDING_DIM).astype(np.float32) * noise
-        emb = centroid + noise_vec
-        norm = np.linalg.norm(emb)
-        embeddings.append(emb / (norm if norm > 0 else 1.0))
-    return embeddings
+def make_embedding(rng: np.random.Generator, doc_type: str, noise: float = 0.08) -> np.ndarray:
+    v = _centroid(doc_type) + rng.standard_normal(EMBEDDING_DIM).astype(np.float32) * noise
+    return v / np.linalg.norm(v)
 
 
 # ---------------------------------------------------------------------------
@@ -205,68 +266,92 @@ def make_embeddings(rng: np.random.Generator, doc_type: str, count: int, noise: 
 _BLUE = "#2196F3"
 _RED = "#F44336"
 _ORANGE = "#FF7043"
+_GREEN = "#4CAF50"
+_AMBER = "#FF9800"
 
 
-def _plot_accuracy_and_speed(df: pd.DataFrame, output_path: Path) -> None:
-    """Two-panel chart: accuracy and latency vs. number of stored embeddings."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle("Embedding Store — Classification Dynamics", fontsize=14, fontweight="bold")
+def _plot_classification_dynamics(df: pd.DataFrame, output_path: Path) -> None:
+    """Three-panel chart: accuracy, latency, and keyword vs. LLM path split."""
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle(
+        "Pipeline Classification Dynamics\n(pipeline._classify_document — keyword path vs. LLM fallback)",
+        fontsize=12,
+        fontweight="bold",
+    )
 
-    x = df["n_stored"]
+    x = df["n_classified"]
 
-    # ── Panel 1: Accuracy ─────────────────────────────────────────────────
+    # Panel 1: Accuracy
     ax = axes[0]
-    ax.plot(x, df["accuracy_pct"], "o-", color=_BLUE, linewidth=2, markersize=6, label="Accuracy (%)")
+    ax.plot(x, df["accuracy_pct"], "o-", color=_BLUE, lw=2, ms=6, label="Accuracy (%)")
     ax.fill_between(x, df["accuracy_pct"], alpha=0.12, color=_BLUE)
-    ax.axhline(y=df["accuracy_pct"].iloc[-1], color=_BLUE, linestyle="--", alpha=0.4, linewidth=1)
-    ax.set_xlabel("Stored Embeddings")
-    ax.set_ylabel("Classification Accuracy (%)")
-    ax.set_title("Accuracy vs. Store Size")
+    ax.set_xlabel("Documents Classified")
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("Classification Accuracy")
     ax.set_ylim(0, 107)
     ax.grid(True, alpha=0.3)
-    ax.legend()
-
-    # Annotate first and last point
-    for idx in (0, -1):
+    ax.legend(fontsize=9)
+    for pos in (0, -1):
         ax.annotate(
-            f"{df['accuracy_pct'].iloc[idx]:.1f}%",
-            xy=(x.iloc[idx], df["accuracy_pct"].iloc[idx]),
-            xytext=(8, -14),
+            f"{df['accuracy_pct'].iloc[pos]:.1f}%",
+            xy=(x.iloc[pos], df["accuracy_pct"].iloc[pos]),
+            xytext=(6, -14),
             textcoords="offset points",
             fontsize=8,
             color=_BLUE,
         )
 
-    # ── Panel 2: Latency ──────────────────────────────────────────────────
+    # Panel 2: Latency
     ax = axes[1]
-    ax.plot(x, df["avg_latency_ms"], "s-", color=_RED, linewidth=2, markersize=6, label="Avg latency (ms)")
+    ax.plot(x, df["avg_latency_ms"], "s-", color=_RED, lw=2, ms=6, label="Avg latency (ms)")
     ax.fill_between(x, df["avg_latency_ms"], df["p95_latency_ms"], alpha=0.18, color=_RED, label="P95 band")
-    ax.plot(x, df["p95_latency_ms"], "^--", color=_ORANGE, linewidth=1.5, markersize=5, label="P95 latency (ms)")
-    ax.set_xlabel("Stored Embeddings")
+    ax.plot(x, df["p95_latency_ms"], "^--", color=_ORANGE, lw=1.5, ms=5, label="P95 latency (ms)")
+    ax.set_xlabel("Documents Classified")
     ax.set_ylabel("Latency (ms)")
-    ax.set_title("Classification Speed vs. Store Size")
+    ax.set_title("Classification Speed")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.legend(fontsize=8)
+
+    # Panel 3: Keyword vs. LLM path split
+    ax = axes[2]
+    ax.stackplot(
+        x,
+        df["keyword_hit_pct"],
+        df["llm_call_pct"],
+        labels=["Keyword path (%)", "LLM fallback (%)"],
+        colors=[_GREEN, _AMBER],
+        alpha=0.82,
+    )
+    ax.set_xlabel("Documents Classified")
+    ax.set_ylabel("Share of Classifications (%)")
+    ax.set_title("Keyword vs. LLM Path Split")
+    ax.set_ylim(0, 105)
+    ax.grid(True, alpha=0.2)
+    ax.legend(fontsize=8)
 
     plt.tight_layout()
     plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
-def _plot_per_category(df: pd.DataFrame, output_path: Path) -> None:
-    """Multi-line chart: per-category accuracy vs. number of stored embeddings."""
+def _plot_per_category_accuracy(df: pd.DataFrame, output_path: Path) -> None:
+    """Multi-line chart: per-category accuracy vs. documents classified."""
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.set_title("Per-Category Classification Accuracy vs. Store Size", fontsize=13, fontweight="bold")
-
+    ax.set_title(
+        "Per-Category Classification Accuracy vs. Documents Classified",
+        fontsize=13,
+        fontweight="bold",
+    )
     colors = plt.cm.tab10(np.linspace(0, 1, len(DOCUMENT_TYPES)))  # type: ignore[attr-defined]
-    x = df["n_stored"]
+    x = df["n_classified"]
 
     for doc_type, color in zip(DOCUMENT_TYPES, colors):
         col = f"acc_{doc_type}"
-        label = doc_type.replace("_", " ").title()
-        ax.plot(x, df[col], "o-", color=color, linewidth=2, markersize=5, label=label)
+        if col in df.columns:
+            ax.plot(x, df[col], "o-", color=color, lw=2, ms=5,
+                    label=doc_type.replace("_", " ").title())
 
-    ax.set_xlabel("Stored Embeddings")
+    ax.set_xlabel("Documents Classified")
     ax.set_ylabel("Accuracy (%)")
     ax.set_ylim(-5, 110)
     ax.grid(True, alpha=0.3)
@@ -283,8 +368,8 @@ def _plot_per_category(df: pd.DataFrame, output_path: Path) -> None:
 
 @pytest.fixture()
 def temp_store_dir():
-    """Yield a fresh temporary directory; remove it unconditionally afterwards."""
-    d = tempfile.mkdtemp(prefix="rag_embed_test_")
+    """Yield a fresh temp directory; remove it unconditionally afterwards."""
+    d = tempfile.mkdtemp(prefix="rag_classify_test_")
     yield d
     shutil.rmtree(d, ignore_errors=True)
 
@@ -294,274 +379,269 @@ def temp_store_dir():
 # ---------------------------------------------------------------------------
 
 
-class TestEmbeddingClassificationDynamics:
+class TestPipelineClassificationDynamics:
     """
-    Measure how classification accuracy and speed evolve as the embedding
-    store grows with progressively more documents.
+    Wraps ``pipeline._classify_document`` to measure accuracy, speed, and
+    path distribution (keyword vs. LLM) as the temporary embedding store grows.
     """
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Test 1: Overall accuracy and speed
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def test_accuracy_and_speed_over_growing_store(self, temp_store_dir: str, tmp_path: Path) -> None:
         """
-        Progressively adds documents to the embedding store in batches.
-        After each batch the full test set is classified and both accuracy
-        (%) and per-query latency (ms) are recorded.
+        Progressively classifies documents from both corpora (keyword-rich and
+        ambiguous) using the real ``_classify_document`` two-stage logic with a
+        mock LLM.  After each batch the cumulative accuracy, latency, and
+        keyword/LLM path counts are recorded.
 
         Assertions
         ----------
-        * Final accuracy ≥ 70 % (cosine k-NN should converge quickly).
-        * Accuracy must not drop more than 5 pp from first to last batch.
-        * The store grows monotonically.
-        * Output PNG is written to *tmp_path* and to artifacts/.
+        * Final accuracy >= 85%
+        * LLM path is used for ambiguous and "unknown" docs (call_count > 0)
+        * Keyword path is used for keyword-rich docs
+        * Output PNG written to tmp_path/ and mirrored to artifacts/
 
-        Graph
-        -----
-        Two-panel figure: accuracy trend + latency trend vs. store size.
+        Graph: three panels — accuracy, latency, keyword vs. LLM split.
         """
         rng = np.random.default_rng(42)
-        store = EmbeddingStore(temp_store_dir, EMBEDDING_DIM)
+        mock_llm = MockLLM(_build_llm_map())
+        classifier = MinimalClassifier(mock_llm)
+        store = ClassificationStore(temp_store_dir)
 
-        # ── Fixed held-out test set ────────────────────────────────────
-        # 10 samples per category, tighter noise so the set is "clean".
-        test_embeddings: list[np.ndarray] = []
-        test_labels: list[str] = []
+        # Build flat doc list: all keyword docs then all ambiguous docs per type
+        all_docs: list[tuple[str, str]] = []
         for doc_type in DOCUMENT_TYPES:
-            embs = make_embeddings(rng, doc_type, count=10, noise=0.05)
-            test_embeddings.extend(embs)
-            test_labels.extend([doc_type] * 10)
+            for text in _KEYWORD_CORPUS.get(doc_type, []):
+                all_docs.append((text, doc_type))
+            for text in _AMBIGUOUS_CORPUS.get(doc_type, []):
+                all_docs.append((text, doc_type))
 
-        # Shuffle test set to avoid ordering bias.
-        perm = rng.permutation(len(test_embeddings))
-        test_embeddings = [test_embeddings[i] for i in perm]
-        test_labels = [test_labels[i] for i in perm]
+        # Shuffle for a realistic interleaved stream
+        indices = rng.permutation(len(all_docs))
+        all_docs = [all_docs[i] for i in indices]
 
-        # ── Progressive training ───────────────────────────────────────
-        DOCS_PER_TYPE_PER_BATCH = 2   # documents added per category per round
-        N_BATCHES = 10                 # rounds → final store: 10 * 2 * 8 = 160 docs
-
+        BATCH_SIZE = 4
         results: list[dict] = []
 
-        for batch_idx in range(N_BATCHES):
-            # Add one batch for every category.
-            for doc_type in DOCUMENT_TYPES:
-                embs = make_embeddings(rng, doc_type, count=DOCS_PER_TYPE_PER_BATCH, noise=0.10)
-                store.add_batch(embs, [doc_type] * DOCS_PER_TYPE_PER_BATCH)
-
-            n_stored = len(store)
-
-            # ── Evaluate accuracy and latency ──────────────────────────
-            correct = 0
+        for batch_start in range(0, len(all_docs), BATCH_SIZE):
+            batch = all_docs[batch_start : batch_start + BATCH_SIZE]
             latencies_ms: list[float] = []
 
-            for q_emb, true_label in zip(test_embeddings, test_labels):
+            for text, true_label in batch:
                 t0 = time.perf_counter()
-                predicted = store.classify(q_emb, top_k=3)
+                predicted = classifier.classify_document(text)
                 latencies_ms.append((time.perf_counter() - t0) * 1_000)
-                if predicted == true_label:
-                    correct += 1
 
-            accuracy_pct = correct / len(test_labels) * 100
+                store.add(text, predicted, true_label, make_embedding(rng, true_label))
+
+            n = len(store)
+            n_llm = mock_llm.call_count
+            n_keyword = n - n_llm
 
             results.append(
                 {
-                    "batch": batch_idx + 1,
-                    "n_stored": n_stored,
-                    "accuracy_pct": accuracy_pct,
+                    "batch": batch_start // BATCH_SIZE + 1,
+                    "n_classified": n,
+                    "accuracy_pct": store.accuracy(),
                     "avg_latency_ms": float(np.mean(latencies_ms)),
                     "p95_latency_ms": float(np.percentile(latencies_ms, 95)),
-                    "store_size_bytes": store.size_bytes,
+                    "keyword_hit_pct": n_keyword / n * 100,
+                    "llm_call_pct": n_llm / n * 100,
                 }
             )
 
         df = pd.DataFrame(results)
 
-        # ── Assertions ─────────────────────────────────────────────────
-        first_acc = df["accuracy_pct"].iloc[0]
-        last_acc = df["accuracy_pct"].iloc[-1]
+        # ── Assertions ──────────────────────────────────────────────────
+        final_acc = df["accuracy_pct"].iloc[-1]
+        assert final_acc >= 85.0, f"Final accuracy {final_acc:.1f}% is too low"
+        assert mock_llm.call_count > 0, "LLM should have been invoked for ambiguous docs"
+        assert len(store) - mock_llm.call_count > 0, "Keyword path should have fired at least once"
+        assert len(store) == len(all_docs)
 
-        assert last_acc > 70.0, f"Final accuracy {last_acc:.1f}% is unexpectedly low"
-        assert last_acc >= first_acc - 5.0, (
-            f"Accuracy regressed: {first_acc:.1f}% → {last_acc:.1f}%"
-        )
-        assert df["n_stored"].is_monotonic_increasing, "Store size should grow each batch"
-
-        # ── Output graph ───────────────────────────────────────────────
-        chart_path = tmp_path / "embedding_dynamics.png"
-        _plot_accuracy_and_speed(df, chart_path)
+        # ── Output graph ────────────────────────────────────────────────
+        chart_path = tmp_path / "classification_dynamics.png"
+        _plot_classification_dynamics(df, chart_path)
         assert chart_path.exists() and chart_path.stat().st_size > 0
 
-        # Mirror to artifacts/ so the chart is visible in the repo.
         artifacts_dir = Path(__file__).parent.parent / "artifacts"
         if artifacts_dir.exists():
-            shutil.copy(chart_path, artifacts_dir / "embedding_dynamics.png")
+            shutil.copy(chart_path, artifacts_dir / "classification_dynamics.png")
 
-        # ── Summary print (visible with -s) ───────────────────────────
         print(
-            f"\n[Dynamics] batches={N_BATCHES}  docs={df['n_stored'].iloc[-1]}  "
-            f"accuracy={last_acc:.1f}%  avg_latency={df['avg_latency_ms'].iloc[-1]:.3f} ms"
+            f"\n[Pipeline Classification]  n={len(store)}"
+            f"  accuracy={final_acc:.1f}%"
+            f"  keyword_hits={len(store) - mock_llm.call_count}"
+            f"  llm_calls={mock_llm.call_count}"
         )
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Test 2: Per-category accuracy breakdown
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     def test_per_category_accuracy_over_growing_store(self, temp_store_dir: str, tmp_path: Path) -> None:
         """
-        Tracks classification accuracy per document type as the store grows.
-        Reveals which categories are harder to distinguish and how quickly
-        each one converges.
+        Tracks classification accuracy per document type as the store grows,
+        revealing which categories rely on the keyword fast-path and which
+        need the LLM fallback.
 
         Assertions
         ----------
-        * Every category achieves ≥ 60 % accuracy by the final batch.
-        * Output PNG is written to *tmp_path* and to artifacts/.
+        * Every category achieves >= 50% accuracy by the final batch
+          (keyword-matched categories will hit 100%; ambiguous-only categories
+          must rely on the mock LLM being consistent)
+        * Output PNG written to tmp_path/ and mirrored to artifacts/
 
-        Graph
-        -----
-        Multi-line chart with one line per document type.
+        Graph: one line per document type.
         """
         rng = np.random.default_rng(99)
-        store = EmbeddingStore(temp_store_dir, EMBEDDING_DIM)
+        mock_llm = MockLLM(_build_llm_map())
+        classifier = MinimalClassifier(mock_llm)
+        store = ClassificationStore(temp_store_dir)
 
-        # Held-out test set: 5 samples per category.
-        test_set: dict[str, list[np.ndarray]] = {
-            doc_type: make_embeddings(rng, doc_type, count=5, noise=0.05)
-            for doc_type in DOCUMENT_TYPES
-        }
+        all_docs: list[tuple[str, str]] = []
+        for doc_type in DOCUMENT_TYPES:
+            for text in _KEYWORD_CORPUS.get(doc_type, []):
+                all_docs.append((text, doc_type))
+            for text in _AMBIGUOUS_CORPUS.get(doc_type, []):
+                all_docs.append((text, doc_type))
 
-        DOCS_PER_TYPE_PER_BATCH = 3
-        N_BATCHES = 8
+        indices = rng.permutation(len(all_docs))
+        all_docs = [all_docs[i] for i in indices]
 
+        BATCH_SIZE = 5
         results: list[dict] = []
 
-        for batch_idx in range(N_BATCHES):
-            for doc_type in DOCUMENT_TYPES:
-                embs = make_embeddings(rng, doc_type, count=DOCS_PER_TYPE_PER_BATCH, noise=0.12)
-                store.add_batch(embs, [doc_type] * DOCS_PER_TYPE_PER_BATCH)
+        for batch_start in range(0, len(all_docs), BATCH_SIZE):
+            batch = all_docs[batch_start : batch_start + BATCH_SIZE]
+            for text, true_label in batch:
+                predicted = classifier.classify_document(text)
+                store.add(text, predicted, true_label, make_embedding(rng, true_label))
 
-            row: dict = {"batch": batch_idx + 1, "n_stored": len(store)}
+            row: dict = {"n_classified": len(store)}
             for doc_type in DOCUMENT_TYPES:
-                correct = sum(
-                    1 for emb in test_set[doc_type] if store.classify(emb, top_k=3) == doc_type
-                )
-                row[f"acc_{doc_type}"] = correct / len(test_set[doc_type]) * 100
+                row[f"acc_{doc_type}"] = store.accuracy_for(doc_type)
             results.append(row)
 
         df = pd.DataFrame(results)
 
-        # ── Assertions ─────────────────────────────────────────────────
+        # ── Assertions ──────────────────────────────────────────────────
         for doc_type in DOCUMENT_TYPES:
             final_acc = df[f"acc_{doc_type}"].iloc[-1]
-            assert final_acc >= 60.0, (
+            assert final_acc >= 50.0, (
                 f"Category '{doc_type}' final accuracy {final_acc:.1f}% is too low"
             )
 
-        # ── Output graph ───────────────────────────────────────────────
+        # ── Output graph ────────────────────────────────────────────────
         chart_path = tmp_path / "per_category_accuracy.png"
-        _plot_per_category(df, chart_path)
+        _plot_per_category_accuracy(df, chart_path)
         assert chart_path.exists() and chart_path.stat().st_size > 0
 
         artifacts_dir = Path(__file__).parent.parent / "artifacts"
         if artifacts_dir.exists():
             shutil.copy(chart_path, artifacts_dir / "per_category_accuracy.png")
 
-        print(
-            f"\n[Per-category] batches={N_BATCHES}  docs={df['n_stored'].iloc[-1]}"
-        )
+        print(f"\n[Per-category]  n={len(store)}")
         for doc_type in DOCUMENT_TYPES:
             print(f"  {doc_type:30s}: {df[f'acc_{doc_type}'].iloc[-1]:.0f}%")
 
-    # ------------------------------------------------------------------
-    # Test 3: Store persistence and reload
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Test 3: Keyword vs LLM path counts per category
+    # -----------------------------------------------------------------------
 
-    def test_store_persists_to_disk_and_reloads(self, temp_store_dir: str) -> None:
+    def test_keyword_vs_llm_path_per_category(self, temp_store_dir: str) -> None:
         """
-        Verify that the embedding store serialises to disk and can be
-        fully reconstructed, producing identical classification results.
+        Verifies that documents containing keyword-map signals are resolved
+        by the fast path (no LLM call) and documents without them use the LLM.
 
         Assertions
         ----------
-        * Disk files are created after the first add().
-        * Reloaded store has the same number of embeddings.
-        * Classification predictions are identical before and after reload.
+        * Every keyword-corpus doc (except "unknown") resolves without an LLM call.
+        * Every ambiguous-corpus doc triggers exactly one LLM call.
+        * "unknown" keyword docs (no keyword_map entry) also trigger an LLM call.
         """
+        mock_llm = MockLLM(_build_llm_map())
+        classifier = MinimalClassifier(mock_llm)
+        store = ClassificationStore(temp_store_dir)
+        rng = np.random.default_rng(0)
+
+        expected_llm_calls = 0
+
+        for doc_type in DOCUMENT_TYPES:
+            # Keyword corpus
+            for text in _KEYWORD_CORPUS.get(doc_type, []):
+                llm_before = mock_llm.call_count
+                predicted = classifier.classify_document(text)
+                store.add(text, predicted, doc_type, make_embedding(rng, doc_type))
+
+                if doc_type == "unknown":
+                    # No keyword_map entry for "unknown" -> must fall to LLM
+                    expected_llm_calls += 1
+                    assert mock_llm.call_count == expected_llm_calls, (
+                        f"'unknown' keyword doc should have gone to LLM: {text[:50]}"
+                    )
+                else:
+                    assert mock_llm.call_count == llm_before, (
+                        f"Keyword doc should NOT trigger LLM: {text[:50]}"
+                    )
+
+            # Ambiguous corpus — all should use LLM
+            for text in _AMBIGUOUS_CORPUS.get(doc_type, []):
+                expected_llm_calls += 1
+                predicted = classifier.classify_document(text)
+                store.add(text, predicted, doc_type, make_embedding(rng, doc_type))
+                assert mock_llm.call_count == expected_llm_calls, (
+                    f"Ambiguous doc should trigger LLM: {text[:50]}"
+                )
+
+        assert mock_llm.call_count == expected_llm_calls
+
+    # -----------------------------------------------------------------------
+    # Test 4: Store persistence round-trip
+    # -----------------------------------------------------------------------
+
+    def test_store_persists_to_disk(self, temp_store_dir: str) -> None:
+        """
+        Classifies a small set of documents and verifies the store serialises
+        both embeddings and metadata to disk correctly.
+
+        Assertions
+        ----------
+        * embeddings.npy and metadata.json exist after classification
+        * Reloaded embedding count matches
+        * Reloaded metadata preserves predicted/true labels and correct flag
+        """
+        mock_llm = MockLLM(_build_llm_map())
+        classifier = MinimalClassifier(mock_llm)
+        store = ClassificationStore(temp_store_dir)
         rng = np.random.default_rng(7)
 
-        store = EmbeddingStore(temp_store_dir, EMBEDDING_DIM)
-        for doc_type in DOCUMENT_TYPES[:4]:
-            embs = make_embeddings(rng, doc_type, count=5, noise=0.10)
-            store.add_batch(embs, [doc_type] * 5)
+        docs = [
+            (_KEYWORD_CORPUS["cover_letter"][0], "cover_letter"),
+            (_AMBIGUOUS_CORPUS["certificate_of_quality"][0], "certificate_of_quality"),
+            (_KEYWORD_CORPUS["bse_tse_declaration"][0], "bse_tse_declaration"),
+        ]
+        for text, true_label in docs:
+            predicted = classifier.classify_document(text)
+            store.add(text, predicted, true_label, make_embedding(rng, true_label))
 
-        n_before = len(store)
+        emb_path = Path(temp_store_dir) / ClassificationStore._EMBEDDINGS_FILE
+        meta_path = Path(temp_store_dir) / ClassificationStore._META_FILE
 
-        # Files must exist on disk.
-        assert (Path(temp_store_dir) / EmbeddingStore._EMBEDDINGS_FILE).exists()
-        assert (Path(temp_store_dir) / EmbeddingStore._LABELS_FILE).exists()
+        assert emb_path.exists(), "embeddings.npy not written"
+        assert meta_path.exists(), "metadata.json not written"
 
-        # Reload from disk.
-        restored = EmbeddingStore.load(temp_store_dir, EMBEDDING_DIM)
-        assert len(restored) == n_before, (
-            f"Loaded {len(restored)} embeddings but expected {n_before}"
-        )
+        loaded_embs = np.load(str(emb_path))
+        with open(meta_path, encoding="utf-8") as fh:
+            loaded_meta = json.load(fh)
 
-        # Predictions must match for unseen queries.
-        for doc_type in DOCUMENT_TYPES[:4]:
-            probe = make_embeddings(rng, doc_type, count=1, noise=0.02)[0]
-            original_pred = store.classify(probe, top_k=3)
-            restored_pred = restored.classify(probe, top_k=3)
-            assert original_pred == restored_pred, (
-                f"Mismatch for {doc_type}: original={original_pred}  restored={restored_pred}"
-            )
+        assert loaded_embs.shape == (len(docs), EMBEDDING_DIM)
+        assert len(loaded_meta) == len(docs)
 
-    # ------------------------------------------------------------------
-    # Test 4: Cold-start edge case (empty store)
-    # ------------------------------------------------------------------
-
-    def test_classify_returns_unknown_on_empty_store(self, temp_store_dir: str) -> None:
-        """An empty store must return 'unknown' rather than raising."""
-        store = EmbeddingStore(temp_store_dir, EMBEDDING_DIM)
-        rng = np.random.default_rng(0)
-        query = rng.standard_normal(EMBEDDING_DIM).astype(np.float32)
-        assert store.classify(query) == "unknown"
-
-    # ------------------------------------------------------------------
-    # Test 5: Latency scales sub-linearly (sanity check)
-    # ------------------------------------------------------------------
-
-    def test_latency_growth_is_reasonable(self, temp_store_dir: str) -> None:
-        """
-        Verify that latency does not blow up as the store grows.
-
-        With a pure numpy cosine search the cost is O(n * d) where n is the
-        store size and d the embedding dimension.  For the sizes used here
-        (≤ 2 000 docs) the search should complete in well under 50 ms on any
-        modern CPU, even without FAISS.
-        """
-        rng = np.random.default_rng(13)
-        store = EmbeddingStore(temp_store_dir, EMBEDDING_DIM)
-
-        # Populate with 2 000 embeddings across all categories.
-        N_DOCS = 2_000
-        batch_labels: list[str] = []
-        batch_embs: list[np.ndarray] = []
-        for i in range(N_DOCS):
-            doc_type = DOCUMENT_TYPES[i % len(DOCUMENT_TYPES)]
-            batch_embs.extend(make_embeddings(rng, doc_type, count=1, noise=0.10))
-            batch_labels.append(doc_type)
-        store.add_batch(batch_embs, batch_labels)
-
-        # Time 20 classification calls.
-        probes = [rng.standard_normal(EMBEDDING_DIM).astype(np.float32) for _ in range(20)]
-        t0 = time.perf_counter()
-        for p in probes:
-            store.classify(p, top_k=3)
-        elapsed_ms = (time.perf_counter() - t0) * 1_000 / len(probes)
-
-        assert elapsed_ms < 50.0, (
-            f"Average classify latency {elapsed_ms:.2f} ms exceeds 50 ms for {N_DOCS} stored docs"
-        )
-        print(f"\n[Latency] {N_DOCS} docs -> avg classify = {elapsed_ms:.3f} ms")
+        for entry in loaded_meta:
+            assert "predicted" in entry
+            assert "true" in entry
+            assert "correct" in entry
+            assert entry["correct"] == (entry["predicted"] == entry["true"])

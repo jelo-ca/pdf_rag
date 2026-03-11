@@ -920,6 +920,135 @@ class RAGPipeline:
         self.clear_cache()
         logger.info("RAG pipeline ready with %d documents.", len(pdf_paths))
 
+    # ------------------------------------------------------------------
+    # Image (OCR) Ingestion
+    # ------------------------------------------------------------------
+
+    def load_images(self, folder_path: str) -> List[Document]:
+        """Extract text from all images in a folder via Tesseract OCR.
+
+        Images are sorted alphabetically so that filename-ordered scans (e.g.
+        ``page-01.png``, ``page-02.png``) are processed in page order.
+        Pages that yield no text after OCR are skipped.
+
+        Args:
+            folder_path: Path to a folder containing PNG/JPG/TIFF image files.
+
+        Returns:
+            A list of :class:`~llama_index.core.Document` objects, one per
+            non-empty image, with the following metadata keys:
+
+            - ``file_name`` – base name of the source folder.
+            - ``page_number`` – 1-based ordering by sorted filename.
+            - ``total_pages`` – total image count in the folder.
+            - ``doc_type`` – always ``"scanned"``.
+            - ``ocr_used`` – always ``True``.
+            - ``source_id`` – unique identifier ``"<folder>:p<page>"``.
+
+        Raises:
+            RuntimeError: If OCR is not available (pytesseract / Tesseract not installed).
+            FileNotFoundError: If *folder_path* does not exist.
+        """
+        if not _is_ocr_runtime_available():
+            raise RuntimeError(
+                "OCR is not available. Install pytesseract and the Tesseract binary "
+                "and ensure it is on PATH to use load_images."
+            )
+        if pytesseract is None or PILImage is None:
+            raise RuntimeError("pytesseract / Pillow not importable.")
+
+        folder = os.path.abspath(folder_path)
+        if not os.path.isdir(folder):
+            raise FileNotFoundError(f"Image folder not found: {folder}")
+
+        image_exts = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif"}
+        image_files = sorted(
+            [
+                os.path.join(folder, f)
+                for f in os.listdir(folder)
+                if os.path.splitext(f)[1].lower() in image_exts
+            ]
+        )
+
+        folder_name = os.path.basename(folder)
+        total_pages = len(image_files)
+        documents: List[Document] = []
+
+        def _ocr_image(img_path: str) -> str:
+            img = PILImage.open(img_path)
+            return pytesseract.image_to_string(img)
+
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as executor:
+            ocr_results = list(executor.map(_ocr_image, image_files))
+
+        for page_num, (_, text) in enumerate(zip(image_files, ocr_results), 1):
+            if not text.strip():
+                continue
+            documents.append(
+                Document(
+                    text=text,
+                    metadata={
+                        "file_name": folder_name,
+                        "page_number": page_num,
+                        "total_pages": total_pages,
+                        "doc_type": "scanned",
+                        "ocr_used": True,
+                        "source_id": f"{folder_name}:p{page_num}",
+                    },
+                )
+            )
+
+        logger.info(
+            "Loaded image folder '%s': %d pages with OCR content (of %d images).",
+            folder_name,
+            len(documents),
+            total_pages,
+        )
+        return documents
+
+    def build_from_images(self, folder_path: str, classify_docs: bool = False) -> None:
+        """Index image files from a folder via OCR and prepare the query engine.
+
+        Processes PNG/JPG/TIFF files sorted alphabetically (preserving page
+        order), OCR-extracts their text, then runs the same chunk → embed →
+        index → retriever pipeline as :meth:`build`.
+
+        Args:
+            folder_path: Path to a folder containing image files.
+            classify_docs: When ``True``, classify each page into a pharma
+                document category and store it in chunk metadata.
+
+        Raises:
+            RuntimeError: If OCR is not available.
+            ValueError: If no text could be extracted from the images.
+        """
+        documents = self.load_images(folder_path)
+        if not documents:
+            raise ValueError(f"No text extracted from images in {folder_path!r}.")
+
+        if classify_docs:
+            documents = self._annotate_pharma_doc_types(documents)
+            before = len(documents)
+            documents = [d for d in documents if d.metadata.get("pharma_doc_type") != "unknown"]
+            dropped = before - len(documents)
+            if dropped:
+                logger.info("Skipping %d page(s) classified as 'unknown'.", dropped)
+
+        self._docs_classified = classify_docs
+        self._pdf_path = folder_path
+
+        self._chunks = self._chunk(documents)
+        self._vector_index = self._index(self._chunks)
+
+        hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
+        self._query_engine = RetrieverQueryEngine.from_args(
+            retriever=hybrid_retriever,
+            llm=self.llm,
+            text_qa_template=_PHARMA_QA_PROMPT,
+        )
+        self.clear_cache()
+        logger.info("RAG pipeline ready from image folder: %s", folder_path)
+
     def clear_cache(self) -> None:
         """Clear the query result cache."""
         self._query_cache.clear()
