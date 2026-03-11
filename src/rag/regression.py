@@ -14,7 +14,6 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import matplotlib.pyplot as plt
 import pandas as pd
 
 
@@ -233,6 +232,9 @@ class RAGRegressionHarness:
         if results_df.empty:
             raise ValueError("results_df is empty; nothing to visualize.")
 
+        # Delay pyplot import to avoid backend issues during module import in headless CI.
+        import matplotlib.pyplot as plt
+
         out_path = Path(output_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -288,6 +290,9 @@ class RAGRegressionHarness:
             raise ValueError(f"comparison_df missing required columns: {', '.join(missing)}")
         if comparison_df.empty:
             raise ValueError("comparison_df is empty; nothing to visualize.")
+
+        # Delay pyplot import to avoid backend issues during module import in headless CI.
+        import matplotlib.pyplot as plt
 
         out_path = Path(output_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)

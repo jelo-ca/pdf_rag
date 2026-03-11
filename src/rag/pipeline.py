@@ -349,6 +349,77 @@ class RAGPipeline:
         img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
         return pytesseract.image_to_string(img)
 
+    def _load_fitz_doc(self, doc: Any, file_name: str) -> List[Document]:
+        """Extract text from an open fitz document, with OCR fallback for scanned pages.
+
+        This is the shared inner loop used by both :meth:`load_pdf` and
+        :meth:`load_images`. Callers are responsible for keeping *doc* open
+        for the duration of this call.
+
+        Args:
+            doc: An open :class:`fitz.Document` object.
+            file_name: Logical name used in document metadata (e.g. the PDF
+                file name or the source folder name for an image set).
+
+        Returns:
+            A list of :class:`~llama_index.core.Document` objects, one per
+            non-empty page, each carrying the standard metadata keys
+            (``file_name``, ``page_number``, ``total_pages``, ``doc_type``,
+            ``ocr_used``, ``source_id``).
+        """
+        ocr_enabled = _is_ocr_runtime_available()
+        total_pages = len(doc)
+
+        # First pass: extract embedded text and flag pages that need OCR.
+        page_data = []
+        for i, page in enumerate(doc):
+            text = page.get_text()
+            page_data.append((i, page, text))
+
+        # Parallel OCR processing for scanned / image-only pages.
+        if ocr_enabled:
+            pages_needing_ocr = [
+                (i, page)
+                for i, page, text in page_data
+                if len(text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD
+            ]
+            if pages_needing_ocr:
+                with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as executor:
+                    ocr_results = list(
+                        executor.map(lambda p: (p[0], self._ocr_page(p[1])), pages_needing_ocr)
+                    )
+                ocr_dict = dict(ocr_results)
+            else:
+                ocr_dict = {}
+        else:
+            ocr_dict = {}
+
+        # Build Document objects.
+        documents: List[Document] = []
+        for i, _, text in page_data:
+            ocr_used = False
+            if i in ocr_dict:
+                text = ocr_dict[i]
+                ocr_used = True
+
+            if not text.strip():
+                continue
+
+            documents.append(
+                Document(
+                    text=text,
+                    metadata={
+                        "file_name": file_name,
+                        "page_number": i + 1,
+                        "total_pages": total_pages,
+                        "doc_type": "scanned" if ocr_used else "digital",
+                        "ocr_used": ocr_used,
+                        "source_id": f"{file_name}:p{i + 1}",
+                    },
+                )
+            )
+        return documents
+
     def load_pdf(self, pdf_path: str) -> List[Document]:
         """Extract text from every page of a PDF, with OCR fallback for scanned pages.
 
@@ -371,61 +442,16 @@ class RAGPipeline:
             - ``ocr_used`` – boolean flag.
             - ``source_id`` – unique identifier in the form ``"<file>:p<page>"``.
         """
-        documents: List[Document] = []
         file_name = os.path.basename(pdf_path)
-        ocr_enabled = _is_ocr_runtime_available()
 
-        if _OCR_AVAILABLE and not ocr_enabled:
+        if _OCR_AVAILABLE and not _is_ocr_runtime_available():
             logger.warning(
                 "pytesseract is installed but no Tesseract binary was found. "
                 "Install Tesseract OCR or add it to PATH to enable scanned-page OCR."
             )
 
         with fitz.open(pdf_path) as doc:
-            # First pass: extract text and identify pages needing OCR
-            page_data = []
-            for i, page in enumerate(doc):
-                text = page.get_text()
-                page_data.append((i, page, text))
-
-            # Parallel OCR processing for scanned pages
-            if ocr_enabled:
-                pages_needing_ocr = [
-                    (i, page) for i, page, text in page_data if len(text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD
-                ]
-
-                if pages_needing_ocr:
-                    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as executor:
-                        ocr_results = list(executor.map(lambda p: (p[0], self._ocr_page(p[1])), pages_needing_ocr))
-                    ocr_dict = dict(ocr_results)
-                else:
-                    ocr_dict = {}
-            else:
-                ocr_dict = {}
-
-            # Build documents
-            for i, page, text in page_data:
-                ocr_used = False
-                if i in ocr_dict:
-                    text = ocr_dict[i]
-                    ocr_used = True
-
-                if not text.strip():
-                    continue
-
-                documents.append(
-                    Document(
-                        text=text,
-                        metadata={
-                            "file_name": file_name,
-                            "page_number": i + 1,
-                            "total_pages": len(doc),
-                            "doc_type": "scanned" if ocr_used else "digital",
-                            "ocr_used": ocr_used,
-                            "source_id": f"{file_name}:p{i + 1}",
-                        },
-                    )
-                )
+            documents = self._load_fitz_doc(doc, file_name)
 
         logger.info("Loaded '%s': %d pages with content.", file_name, len(documents))
         return documents
@@ -954,8 +980,6 @@ class RAGPipeline:
                 "OCR is not available. Install pytesseract and the Tesseract binary "
                 "and ensure it is on PATH to use load_images."
             )
-        if pytesseract is None or PILImage is None:
-            raise RuntimeError("pytesseract / Pillow not importable.")
 
         folder = os.path.abspath(folder_path)
         if not os.path.isdir(folder):
@@ -971,38 +995,29 @@ class RAGPipeline:
         )
 
         folder_name = os.path.basename(folder)
-        total_pages = len(image_files)
-        documents: List[Document] = []
 
-        def _ocr_image(img_path: str) -> str:
-            img = PILImage.open(img_path)
-            return pytesseract.image_to_string(img)
+        if not image_files:
+            logger.info("Image folder '%s' contains no recognised image files.", folder_name)
+            return []
 
-        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as executor:
-            ocr_results = list(executor.map(_ocr_image, image_files))
-
-        for page_num, (_, text) in enumerate(zip(image_files, ocr_results), 1):
-            if not text.strip():
-                continue
-            documents.append(
-                Document(
-                    text=text,
-                    metadata={
-                        "file_name": folder_name,
-                        "page_number": page_num,
-                        "total_pages": total_pages,
-                        "doc_type": "scanned",
-                        "ocr_used": True,
-                        "source_id": f"{folder_name}:p{page_num}",
-                    },
-                )
-            )
+        # Wrap each image into a single in-memory PDF so that _load_fitz_doc
+        # (and its _ocr_page path) handles OCR — exactly the same as a scanned PDF.
+        pdf_doc = fitz.open()
+        try:
+            for img_path in image_files:
+                with fitz.open(img_path) as img_fitz:
+                    pdf_bytes = img_fitz.convert_to_pdf()
+                with fitz.open(stream=pdf_bytes, filetype="pdf") as one_page_pdf:
+                    pdf_doc.insert_pdf(one_page_pdf)
+            documents = self._load_fitz_doc(pdf_doc, folder_name)
+        finally:
+            pdf_doc.close()
 
         logger.info(
             "Loaded image folder '%s': %d pages with OCR content (of %d images).",
             folder_name,
             len(documents),
-            total_pages,
+            len(image_files),
         )
         return documents
 

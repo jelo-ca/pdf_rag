@@ -17,11 +17,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 import matplotlib
+matplotlib.use("Agg")
 import pandas as pd
 
 from rag.regression import RAGRegressionHarness
-
-matplotlib.use("Agg")
 
 
 @dataclass

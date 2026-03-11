@@ -1,6 +1,6 @@
 # Local RAG Pipeline
 
-A local, offline Retrieval-Augmented Generation (RAG) pipeline for pharmaceutical PDF question answering.
+A local, offline Retrieval-Augmented Generation (RAG) pipeline for pharmaceutical document question answering over PDFs and scanned images.
 
 The project runs fully on-device with a local GGUF model through `llama-cpp-python`.
 
@@ -10,6 +10,7 @@ This repository provides:
 
 - A reusable Python package (`src/rag`) with `RAGPipeline`
 - PDF ingestion via PyMuPDF with OCR fallback for scanned pages
+- Image-folder ingestion via Tesseract OCR (`build_from_images`)
 - Fixed-size text chunking (`SentenceSplitter`, chunk size 512, overlap 50)
 - Hybrid retrieval (vector + BM25) fused with reciprocal rerank
 - Optional pharma document/page classification and query-time classification
@@ -18,7 +19,7 @@ This repository provides:
 - Streaming query responses with source metadata
 - Notebook-based Gradio UI demo (`notebooks/rag.ipynb`)
 - Unit tests for core pipeline behavior (`tests/test_rag_pipeline.py`)
-- Pandas-based regression harness for answer/retrieval drift tracking
+- Pandas-based regression harness for PDF and OCR drift tracking
 
 Out of scope for this repo:
 
@@ -28,9 +29,9 @@ Out of scope for this repo:
 ## Architecture
 
 ```text
-PDF(s)
-  -> load_pdf (PyMuPDF)
-  -> optional OCR fallback for sparse/scanned pages (Tesseract)
+Input
+  -> PDF(s): load_pdf (PyMuPDF) + optional OCR fallback for sparse/scanned pages
+  -> Image folder(s): load_images (Tesseract OCR)
   -> optional pharma page classification (keyword + batched LLM)
   -> chunking (SentenceSplitter)
   -> indexing (VectorStoreIndex)
@@ -55,14 +56,19 @@ RAG/
     __init__.py
     pipeline.py
     demos/multi_file.py
+  scripts/
+    run_regression.py
   tests/
     conftest.py
     test_rag_pipeline.py
+    test_regression_harness.py
+    test_embedding_dynamics.py
   notebooks/
     rag.ipynb
     storage/
   docs/
     *.pdf
+    image_test_*/
   storage/
   requirements.txt
   requirements-dev.txt
@@ -145,12 +151,31 @@ for s in result["sources"]:
     print(s["file"], s["page"], s["score"])
 ```
 
+### Scanned Image Folder (OCR)
+
+```python
+from rag import RAGPipeline
+
+rag = RAGPipeline()
+rag.build_from_images("docs/image_test_1", classify_docs=False)
+
+result = rag.query_with_sources("What is the product code?")
+print(result["answer"])
+```
+
+Notes:
+
+- `build_from_images(...)` expects image files in one folder and processes them in sorted filename order.
+- OCR requires both Python packages (`pytesseract`, `pillow`) and a Tesseract executable on PATH (or standard Windows install path).
+
 ## Public API
 
 Primary class: `rag.RAGPipeline`
 
 - `build(pdf_path, classify_docs=False)`
 - `build_from_multiple_pdfs(pdf_paths, classify_docs=False, progress_callback=None)`
+- `load_images(folder_path)`
+- `build_from_images(folder_path, classify_docs=False)`
 - `query(question, expand=False, num_expansions=3, classify=False)`
 - `query_with_sources(question, expand=False, num_expansions=3, classify=False)`
 - `stream_query_with_sources(question, expand=False, num_expansions=3, classify=False)`
@@ -195,6 +220,32 @@ Run tests:
 ```bash
 pytest
 ```
+
+Run the pipeline classification dynamics test module:
+
+```bash
+pytest tests/test_embedding_dynamics.py -s
+```
+
+Run the full regression script (PDF phase plus OCR image-folder phase when `image_test_*` folders are present):
+
+```bash
+python scripts/run_regression.py --docs-dir docs --artifacts-dir artifacts
+```
+
+Regression script behavior (current):
+
+- Phase 1 (PDF): indexes all `docs/*.pdf` with `classify_docs=True`, runs the combined PDF test suite, writes PDF CSV/PNG artifacts.
+- Phase 2 (OCR): discovers `docs/image_test_*` folders, builds an index per folder with `build_from_images(..., classify_docs=False)`, runs matching image suites, writes OCR CSV/PNG artifacts.
+- Phase 3 (baseline): when `--baseline` is provided, baseline comparison is currently computed against the PDF regression results.
+
+Outputs are written to `artifacts/`:
+
+- `regression_results.csv`
+- `regression_dashboard.png`
+- `image_regression_results.csv` (when image folders are present)
+- `image_regression_dashboard.png` (when image folders are present)
+- `baseline_comparison.csv` and `baseline_comparison_dashboard.png` (when `--baseline` is used)
 
 Regression harness example:
 
@@ -251,9 +302,19 @@ pylint src
   - Ensure Tesseract binary is installed and discoverable.
   - Ensure `pytesseract` and `pillow` are installed.
 
+- OCR image-folder build fails (`build_from_images`)
+
+  - Verify the folder exists and contains supported files (`.png`, `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.bmp`, `.gif`).
+  - Ensure Tesseract runtime is available (same requirements as scanned PDF OCR).
+
 - `RuntimeError: Pipeline not built`
 
-  - Call `build(...)` or `build_from_multiple_pdfs(...)` before query methods.
+  - Call `build(...)`, `build_from_multiple_pdfs(...)`, or `build_from_images(...)` before query methods.
+
+- OCR phase is skipped in regression script
+
+  - Ensure your docs directory contains folders named like `image_test_1`, `image_test_2`, etc.
+  - Ensure OCR runtime is available; otherwise each image folder is skipped with an OCR runtime error.
 
 - Slow CPU performance
   - Use GPU offload (`N_GPU_LAYERS`) or a smaller quantized GGUF model.
