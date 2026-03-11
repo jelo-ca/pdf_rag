@@ -233,7 +233,7 @@ class RAGRegressionHarness:
             raise ValueError("results_df is empty; nothing to visualize.")
 
         # Delay pyplot import to avoid backend issues during module import in headless CI.
-        import matplotlib.pyplot as plt
+        import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
 
         out_path = Path(output_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,7 +292,7 @@ class RAGRegressionHarness:
             raise ValueError("comparison_df is empty; nothing to visualize.")
 
         # Delay pyplot import to avoid backend issues during module import in headless CI.
-        import matplotlib.pyplot as plt
+        import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
 
         out_path = Path(output_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
