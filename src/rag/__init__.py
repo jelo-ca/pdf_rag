@@ -8,6 +8,7 @@ Main Components:
 """
 
 from rag.pipeline import RAGPipeline
+from rag.regression import RAGRegressionHarness, RegressionThresholds
 
 __version__ = "0.1.0"
-__all__ = ["RAGPipeline"]
+__all__ = ["RAGPipeline", "RAGRegressionHarness", "RegressionThresholds"]

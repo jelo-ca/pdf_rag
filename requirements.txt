@@ -27,6 +27,10 @@ nest-asyncio>=1.6.0
 # Environment variables
 python-dotenv>=1.2.2
 
+# Regression data collection and analysis
+pandas>=2.2.0
+matplotlib>=3.8.0
+
 # ── Optional: OCR (scanned PDF support) ───────────────────────────────────────
 # Also requires the Tesseract binary: https://github.com/tesseract-ocr/tesseract
 pytesseract>=0.3.13

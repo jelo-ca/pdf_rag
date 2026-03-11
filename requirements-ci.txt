@@ -6,6 +6,8 @@
 # Direct runtime imports that are lightweight enough to install normally
 pymupdf>=1.27.1
 python-dotenv>=1.2.2
+pandas>=2.2.0
+matplotlib>=3.8.0
 
 # Testing
 pytest>=7.0.0

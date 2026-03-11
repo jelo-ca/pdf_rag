@@ -38,6 +38,8 @@ dependencies = [
     "gradio>=6.9.0",
     "nest-asyncio>=1.6.0",
     "python-dotenv",
+    "pandas>=2.2.0",
+    "matplotlib>=3.8.0",
 ]
 
 [project.optional-dependencies]

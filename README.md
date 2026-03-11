@@ -18,6 +18,7 @@ This repository provides:
 - Streaming query responses with source metadata
 - Notebook-based Gradio UI demo (`notebooks/rag.ipynb`)
 - Unit tests for core pipeline behavior (`tests/test_rag_pipeline.py`)
+- Pandas-based regression harness for answer/retrieval drift tracking
 
 Out of scope for this repo:
 
@@ -193,6 +194,44 @@ Run tests:
 
 ```bash
 pytest
+```
+
+Regression harness example:
+
+```python
+from rag import RAGPipeline, RAGRegressionHarness
+
+rag = RAGPipeline()
+rag.build("docs/Sample1.pdf", classify_docs=True)
+
+suite = RAGRegressionHarness.create_test_suite([
+  {
+    "test_id": "TC-001",
+    "query": "What is the batch number?",
+    "expected_query_category": "certificate_of_quality",
+    "required_terms": "batch|lot",
+    "min_sources": 1,
+    "classify": True,
+  }
+])
+
+harness = RAGRegressionHarness(rag)
+results = harness.run(suite)
+summary = harness.summarize(results)
+
+print(summary)
+results.to_csv("regression_results.csv", index=False)
+
+# Create a visualization dashboard for this run
+harness.visualize_results(results, "regression_dashboard.png")
+```
+
+If you have a baseline comparison DataFrame from `compare_to_baseline(...)`,
+you can generate a drift dashboard:
+
+```python
+comparison = harness.compare_to_baseline(current_results=results, baseline_results=baseline)
+harness.visualize_comparison(comparison, "baseline_comparison_dashboard.png")
 ```
 
 Run linting:
