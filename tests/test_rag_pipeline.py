@@ -236,6 +236,7 @@ class TestLoadPdf:
 
         with patch("rag.pipeline.fitz.open", return_value=mock_doc), \
              patch("rag.pipeline._OCR_AVAILABLE", True), \
+             patch("rag.pipeline._is_ocr_runtime_available", return_value=True), \
              patch.object(pipeline, "_ocr_page", return_value=ocr_text) as mock_ocr:
             docs = pipeline.load_pdf(str(tmp_path / "scan.pdf"))
 
@@ -280,6 +281,7 @@ class TestLoadPdf:
 
         with patch("rag.pipeline.fitz.open", return_value=mock_doc), \
              patch("rag.pipeline._OCR_AVAILABLE", True), \
+             patch("rag.pipeline._is_ocr_runtime_available", return_value=True), \
              patch.object(pipeline, "_ocr_page", return_value="   "):
             docs = pipeline.load_pdf(str(tmp_path / "blank_scan.pdf"))
 

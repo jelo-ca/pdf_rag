@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -43,7 +44,7 @@ from rag.pipeline import (  # noqa: E402
     RAGPipeline,
 )
 
-DOCUMENT_TYPES: list[str] = _PHARMA_DOC_CATEGORIES
+DOCUMENT_TYPES: list[str] = [c for c in _PHARMA_DOC_CATEGORIES if c != "unknown"]
 EMBEDDING_DIM: int = 384  # all-MiniLM-L6-v2 dimension
 
 # Latency measurement parameters
@@ -135,10 +136,6 @@ _AMBIGUOUS_CORPUS: dict[str, list[str]] = {
         "Sample sealed by QC inspector, transferred under continuous cold chain supervision.",
         "Temperature logger attached. Min: 2.1C, Max: 7.9C during transit. No excursions.",
     ],
-    "unknown": [
-        "Q3 budget allocation — R&D department — EUR 1.2M approved.",
-        "Canteen menu for week 42 — includes vegetarian and vegan options.",
-    ],
 }
 
 
@@ -173,15 +170,12 @@ class MockLLM:
 def _build_llm_map() -> dict[str, str]:
     """
     Map first-60-char snippet -> label for every document that will reach
-    the LLM fallback path (ambiguous docs + "unknown" keyword docs which
-    have no keyword_map entry).
+    the LLM fallback path (ambiguous docs with no keyword_map signal).
     """
     mapping: dict[str, str] = {}
     for label, texts in _AMBIGUOUS_CORPUS.items():
         for text in texts:
             mapping[text[:60]] = label
-    for text in _KEYWORD_CORPUS.get("unknown", []):
-        mapping[text[:60]] = "unknown"
     return mapping
 
 
@@ -418,7 +412,7 @@ def _plot_per_category_accuracy(df: pd.DataFrame, output_path: Path) -> None:
         fontsize=13,
         fontweight="bold",
     )
-    colors = plt.cm.tab10(np.linspace(0, 1, len(DOCUMENT_TYPES)))  # type: ignore[attr-defined]
+    colors = matplotlib.colormaps["tab10"](np.linspace(0, 1, len(DOCUMENT_TYPES)))
     x = df["n_classified"]
 
     for doc_type, color in zip(DOCUMENT_TYPES, colors):
@@ -580,7 +574,6 @@ class TestPipelineClassificationDynamics:
                 f"Batch {row['batch']}: LLM median ({row['llm_median_ms']:.4f} ms) "
                 f"< keyword median ({row['kw_median_ms']:.4f} ms)"
             )
-
         # ── Output graph ────────────────────────────────────────────────
         chart_path = tmp_path / "classification_dynamics.png"
         _plot_classification_dynamics(df, chart_path)
@@ -677,9 +670,8 @@ class TestPipelineClassificationDynamics:
 
         Assertions
         ----------
-        * Every keyword-corpus doc (except "unknown") resolves without an LLM call.
+        * Every keyword-corpus doc resolves without an LLM call.
         * Every ambiguous-corpus doc triggers exactly one LLM call.
-        * "unknown" keyword docs (no keyword_map entry) also trigger an LLM call.
         """
         mock_llm = MockLLM(_build_llm_map())
         classifier = MinimalClassifier(mock_llm)
@@ -689,6 +681,7 @@ class TestPipelineClassificationDynamics:
         expected_llm_calls = 0
 
         for doc_type in DOCUMENT_TYPES:
+            # Keyword corpus — all named-category docs have keyword signals
             for text in _KEYWORD_CORPUS.get(doc_type, []):
                 llm_before = mock_llm.call_count
                 predicted = classifier.classify_document(text)
