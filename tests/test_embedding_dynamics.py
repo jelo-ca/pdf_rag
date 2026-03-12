@@ -329,7 +329,7 @@ def _plot_per_category_accuracy(df: pd.DataFrame, output_path: Path) -> None:
         fontsize=13,
         fontweight="bold",
     )
-    colors = plt.cm.tab10(np.linspace(0, 1, len(DOCUMENT_TYPES)))  # type: ignore[attr-defined]
+    colors = matplotlib.colormaps["tab10"](np.linspace(0, 1, len(DOCUMENT_TYPES)))
     x = df["n_classified"]
 
     for doc_type, color in zip(DOCUMENT_TYPES, colors):
