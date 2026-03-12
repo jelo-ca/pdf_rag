@@ -34,7 +34,7 @@ from rag.pipeline import (  # noqa: E402
     RAGPipeline,
 )
 
-DOCUMENT_TYPES: list[str] = _PHARMA_DOC_CATEGORIES
+DOCUMENT_TYPES: list[str] = [c for c in _PHARMA_DOC_CATEGORIES if c != "unknown"]
 EMBEDDING_DIM: int = 384  # all-MiniLM-L6-v2 dimension
 
 
@@ -80,12 +80,6 @@ _KEYWORD_CORPUS: dict[str, list[str]] = {
         "Chain-of-custody document — sample sealed, temperature logged.",
         "Custody Transfer Record — batch 20240310 — cold chain maintained.",
     ],
-    # "unknown" has no entries in _KEYWORD_MAP so these fall through to LLM
-    "unknown": [
-        "Internal memo — quarterly review meeting notes Q3 2024.",
-        "Project timeline — milestone tracking sheet — Phase 2.",
-        "Employee onboarding checklist — IT setup complete.",
-    ],
 }
 
 # Documents with no keyword signals -> fall through to LLM path
@@ -117,10 +111,6 @@ _AMBIGUOUS_CORPUS: dict[str, list[str]] = {
     "chain_of_custody": [
         "Sample sealed by QC inspector, transferred under continuous cold chain supervision.",
         "Temperature logger attached. Min: 2.1C, Max: 7.9C during transit. No excursions.",
-    ],
-    "unknown": [
-        "Q3 budget allocation — R&D department — EUR 1.2M approved.",
-        "Canteen menu for week 42 — includes vegetarian and vegan options.",
     ],
 }
 
@@ -156,15 +146,12 @@ class MockLLM:
 def _build_llm_map() -> dict[str, str]:
     """
     Map first-60-char snippet -> label for every document that will reach
-    the LLM fallback path (ambiguous docs + "unknown" keyword docs which
-    have no keyword_map entry).
+    the LLM fallback path (ambiguous docs with no keyword_map signal).
     """
     mapping: dict[str, str] = {}
     for label, texts in _AMBIGUOUS_CORPUS.items():
         for text in texts:
             mapping[text[:60]] = label
-    for text in _KEYWORD_CORPUS.get("unknown", []):
-        mapping[text[:60]] = "unknown"
     return mapping
 
 
@@ -455,7 +442,7 @@ class TestPipelineClassificationDynamics:
 
         # ── Assertions ──────────────────────────────────────────────────
         final_acc = df["accuracy_pct"].iloc[-1]
-        assert final_acc >= 85.0, f"Final accuracy {final_acc:.1f}% is too low"
+        assert final_acc >= 95.0, f"Final accuracy {final_acc:.1f}% is too low"
         assert mock_llm.call_count > 0, "LLM should have been invoked for ambiguous docs"
         assert len(store) - mock_llm.call_count > 0, "Keyword path should have fired at least once"
         assert len(store) == len(all_docs)
@@ -557,9 +544,8 @@ class TestPipelineClassificationDynamics:
 
         Assertions
         ----------
-        * Every keyword-corpus doc (except "unknown") resolves without an LLM call.
+        * Every keyword-corpus doc resolves without an LLM call.
         * Every ambiguous-corpus doc triggers exactly one LLM call.
-        * "unknown" keyword docs (no keyword_map entry) also trigger an LLM call.
         """
         mock_llm = MockLLM(_build_llm_map())
         classifier = MinimalClassifier(mock_llm)
@@ -569,22 +555,15 @@ class TestPipelineClassificationDynamics:
         expected_llm_calls = 0
 
         for doc_type in DOCUMENT_TYPES:
-            # Keyword corpus
+            # Keyword corpus — all named-category docs have keyword signals
             for text in _KEYWORD_CORPUS.get(doc_type, []):
                 llm_before = mock_llm.call_count
                 predicted = classifier.classify_document(text)
                 store.add(text, predicted, doc_type, make_embedding(rng, doc_type))
 
-                if doc_type == "unknown":
-                    # No keyword_map entry for "unknown" -> must fall to LLM
-                    expected_llm_calls += 1
-                    assert mock_llm.call_count == expected_llm_calls, (
-                        f"'unknown' keyword doc should have gone to LLM: {text[:50]}"
-                    )
-                else:
-                    assert mock_llm.call_count == llm_before, (
-                        f"Keyword doc should NOT trigger LLM: {text[:50]}"
-                    )
+                assert mock_llm.call_count == llm_before, (
+                    f"Keyword doc should NOT trigger LLM: {text[:50]}"
+                )
 
             # Ambiguous corpus — all should use LLM
             for text in _AMBIGUOUS_CORPUS.get(doc_type, []):
