@@ -122,11 +122,11 @@ logger = logging.getLogger(__name__)
 
 _PHARMA_QA_PROMPT = PromptTemplate(
     "You are a pharmaceutical document assistant. "
-    "Answer the question based ONLY on the context provided below. "
-    "Be as brief as possible: 1-2 sentences maximum. "
-    "If a list is requested, use bullet points with no extra explanation. "
-    "Never add background, reasoning, or context beyond what directly answers the question. "
-    "Do not include citations in the answer text.\n\n"
+    "Answer using ONLY the context below. "
+    "Format rules: use bullet points whenever possible. "
+    "Only use a sentence if a bullet list does not make sense. "
+    "Be extremely brief — no preamble, no reasoning, no citations, no filler. "
+    "Stop immediately after the answer.\n\n"
     "Context:\n{context_str}\n\n"
     "Question: {query_str}\n\n"
     "Answer:"
@@ -299,7 +299,7 @@ class RAGPipeline:
         self.llm: LlamaCPP = LlamaCPP(
             model_path=_model_path,
             temperature=0.1,
-            max_new_tokens=512,
+            max_new_tokens=200,
             context_window=8192,
             model_kwargs={"n_gpu_layers": _gpu_layers},
             verbose=False,
