@@ -121,12 +121,14 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
 
 _PHARMA_QA_PROMPT = PromptTemplate(
-    "You are a pharmaceutical document assistant. "
-    "Answer using ONLY the context below. "
-    "Format rules: use bullet points whenever possible. "
-    "Only use a sentence if a bullet list does not make sense. "
-    "Be extremely brief — no preamble, no reasoning, no citations, no filler. "
-    "Stop immediately after the answer.\n\n"
+    "You are a pharmaceutical document assistant.\n"
+    "Answer using ONLY the context below.\n"
+    "Use exact terms, values, names, and numbers directly from the context — do not paraphrase or generalise.\n"
+    "Format rules:\n"
+    "  • DEFAULT: answer as a bullet list (one fact per bullet).\n"
+    "  • Use prose ONLY when the question explicitly asks to explain, describe, or compare.\n"
+    "  • No preamble, no reasoning, no citations, no filler.\n"
+    "  • Stop immediately after the last bullet or sentence.\n\n"
     "Context:\n{context_str}\n\n"
     "Question: {query_str}\n\n"
     "Answer:"
@@ -882,6 +884,7 @@ class RAGPipeline:
         pdf_paths: List[str],
         classify_docs: bool = False,
         progress_callback: Optional[callable] = None,
+        force_rebuild: bool = True,
     ) -> None:
         """Index multiple PDF documents into a single unified index.
 
@@ -895,12 +898,41 @@ class RAGPipeline:
                 its ``pharma_doc_type`` is stored in chunk metadata.
             progress_callback: Optional callback function called after each PDF
                 is loaded. Receives (current_index, total_count, filename).
+            force_rebuild: When ``False`` and a persisted index already exists at
+                ``persist_dir``, the stored index is loaded directly, skipping PDF
+                loading and LLM classification entirely.  Defaults to ``True``
+                (always rebuild) to preserve backwards-compatible behaviour.
 
         Raises:
             ValueError: If pdf_paths is empty.
         """
         if not pdf_paths:
             raise ValueError("No PDF paths provided.")
+
+        # Fast-path: load an already-built persisted index without touching the LLM.
+        if not force_rebuild and self.persist_dir and os.path.exists(self.persist_dir):
+            try:
+                logger.info("Loading persisted index from %s …", self.persist_dir)
+                storage_context = StorageContext.from_defaults(persist_dir=self.persist_dir)
+                self._vector_index = load_index_from_storage(storage_context)
+                self._chunks = list(self._vector_index.docstore.docs.values())
+                self._docs_classified = classify_docs
+                self._pdf_path = f"Multiple files ({len(pdf_paths)} PDFs)"
+                hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
+                self._query_engine = RetrieverQueryEngine.from_args(
+                    retriever=hybrid_retriever,
+                    llm=self.llm,
+                    text_qa_template=_PHARMA_QA_PROMPT,
+                )
+                self.clear_cache()
+                logger.info(
+                    "Pipeline ready from cache: %d chunks, %d PDFs.",
+                    len(self._chunks),
+                    len(pdf_paths),
+                )
+                return
+            except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+                logger.warning("Could not load persisted index (%s); rebuilding.", exc)
 
         # Clear persistence dir since we're building from multiple sources
         if self.persist_dir and os.path.exists(self.persist_dir):

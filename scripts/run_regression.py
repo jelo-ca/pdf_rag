@@ -48,6 +48,16 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional GGUF path override. If omitted, RAGPipeline uses env/default resolution.",
     )
+    parser.add_argument(
+        "--index-dir",
+        type=str,
+        default="",
+        help=(
+            "Directory for a persistent vector index. "
+            "On the first run the index is built and saved here; "
+            "subsequent runs load it directly, skipping PDF ingestion and LLM classification."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -758,6 +768,311 @@ def suite_image_test5() -> list[dict]:
     ]
 
 
+def suite_test10() -> list[dict]:
+    """Tests for test_10.pdf — FDA Response Letter: RNA Integrity / CGE Method (BLA 125742, 23 Jul 2021).
+
+    Document type: BLA regulatory response letter.
+    Key facts: BLA 125742, IND BB-IND 19736, dated 23 July 2021,
+               addressee Marion Gruber PhD (FDA/CBER/OVRR),
+               subject: validation of RNA integrity by capillary gel electrophoresis (CGE).
+    """
+    return [
+        {
+            "test_id": "T10-001",
+            "query": "What BLA number is referenced in this FDA response letter?",
+            "required_terms": "125742|BLA",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T10-002",
+            "query": "What analytical method is the subject of this FDA information request?",
+            "required_terms": "CGE|capillary gel electrophoresis|RNA integrity|RNA",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T10-003",
+            "query": "What is the date of this FDA response letter?",
+            "required_terms": "23 July 2021|July 2021|23-Jul|2021",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+        {
+            "test_id": "T10-004",
+            "query": "What is the IND number referenced in this regulatory submission?",
+            "required_terms": "19736|BB-IND|IND",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+        {
+            "test_id": "T10-005",
+            "query": "Who is the FDA recipient named in this response letter?",
+            "required_terms": "Marion Gruber|Gruber|CBER|OVRR|FDA",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+        {
+            "test_id": "T10-006",
+            "query": "What vaccine product does this BLA submission cover?",
+            "required_terms": "BNT162|PF-07302048|COVID-19|COMIRNATY|mRNA",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+    ]
+
+
+def suite_test11() -> list[dict]:
+    """Tests for test_11.pdf — FDA Response Letter: Sterility and Endotoxin Methods (BLA 125742, 30 Jul 2021).
+
+    Document type: BLA regulatory response letter.
+    Key facts: BLA 125742, IND BB-IND 19736, dated 30 July 2021,
+               subject: sterility and endotoxin test methods,
+               facilities: PGS-Puurs and PGS-KZO,
+               FDA control number FDA-CBER-2021-5683-1149402.
+    """
+    return [
+        {
+            "test_id": "T11-001",
+            "query": "What BLA number is referenced in this FDA response?",
+            "required_terms": "125742|BLA",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T11-002",
+            "query": "What test methods are discussed in this FDA information request response?",
+            "required_terms": "sterility|endotoxin|sterile",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T11-003",
+            "query": "What manufacturing facilities are referenced in this document?",
+            "required_terms": "PGS-Puurs|PGS-KZO|Puurs|Kalamazoo",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T11-004",
+            "query": "What is the date of this regulatory response letter?",
+            "required_terms": "30 July 2021|July 2021|30-Jul|2021",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+        {
+            "test_id": "T11-005",
+            "query": "What is the FDA control number for this submission?",
+            "required_terms": "FDA-CBER-2021-5683|1149402",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+        {
+            "test_id": "T11-006",
+            "query": "What vaccine product does this FDA response cover?",
+            "required_terms": "BNT162|PF-07302048|COVID-19|mRNA",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+    ]
+
+
+def suite_test12() -> list[dict]:
+    """Tests for test_12.pdf — Technical Response: Sterility and Endotoxin Verification (BLA 125742/0, 16 Jul 2021).
+
+    Document type: Technical regulatory submission (FDA query response).
+    Key facts: BLA 125742/0, dated 16 July 2021, approved 29 July 2021,
+               LAL (endotoxin) and sterility method verification,
+               PPC (positive product control) percent recoveries reported,
+               facilities: PGS-Puurs, PGS-KZO.
+    """
+    return [
+        {
+            "test_id": "T12-001",
+            "query": "What analytical methods are verified in this FDA technical response?",
+            "required_terms": "sterility|endotoxin|LAL|PPC",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T12-002",
+            "query": "What does PPC stand for in this endotoxin testing document?",
+            "required_terms": "positive product control|PPC",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+        {
+            "test_id": "T12-003",
+            "query": "Which testing facilities are mentioned in this sterility and endotoxin verification?",
+            "required_terms": "PGS-Puurs|PGS-KZO|Puurs|Kalamazoo",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T12-004",
+            "query": "What is the BLA number associated with this technical document?",
+            "required_terms": "125742|BLA",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T12-005",
+            "query": "What method is used for endotoxin testing in this document?",
+            "required_terms": "LAL|limulus|endotoxin",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T12-006",
+            "query": "When was this technical document approved or submitted?",
+            "required_terms": "2021|July 2021|29 July|29-Jul",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+    ]
+
+
+def suite_test13() -> list[dict]:
+    """Tests for test_13.pdf — FDA Response Letter: Manufacturing and Equipment (BLA 125742, 30 Jul 2021).
+
+    Document type: BLA regulatory response letter.
+    Key facts: BLA 125742, IND BB-IND 19736, dated 30 July 2021,
+               subject: manufacturing and equipment queries,
+               FDA contact: Laura Gottschalk PhD (CBER/OVRR),
+               original BLA submission: 18 May 2021.
+    """
+    return [
+        {
+            "test_id": "T13-001",
+            "query": "What is the subject of this FDA information request response?",
+            "required_terms": "manufacturing|equipment",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T13-002",
+            "query": "What BLA number is cited in this regulatory submission?",
+            "required_terms": "125742|BLA",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T13-003",
+            "query": "What is the date of this FDA manufacturing response letter?",
+            "required_terms": "30 July 2021|July 2021|30-Jul|2021",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+        {
+            "test_id": "T13-004",
+            "query": "Who is the FDA contact person referenced in this letter?",
+            "required_terms": "Laura Gottschalk|Gottschalk|CBER|OVRR",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+        {
+            "test_id": "T13-005",
+            "query": "Who is the applicant or sender named in this BLA response?",
+            "required_terms": "BioNTech|Pfizer|Pharmacia|Upjohn",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T13-006",
+            "query": "What is the original BLA submission date mentioned in this letter?",
+            "required_terms": "18 May 2021|May 2021|18-May|2021",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+    ]
+
+
+def suite_test14() -> list[dict]:
+    """Tests for test_14.pdf — Technical Response: Manufacturing and Equipment (BLA 125742/0, 26 Jul 2021).
+
+    Document type: Technical regulatory submission (FDA query response).
+    Key facts: BLA 125742/0, dated 26 July 2021, approved 30 July 2021,
+               16 manufacturing/equipment queries addressed,
+               bioburden and endotoxin action limits, hold times,
+               validated shipping with temperature monitoring,
+               facilities: PGS-Puurs, PGS-KZO.
+    """
+    return [
+        {
+            "test_id": "T14-001",
+            "query": "What testing parameters are addressed in this manufacturing technical response?",
+            "required_terms": "bioburden|endotoxin|hold time|sterility",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T14-002",
+            "query": "How many FDA queries are addressed in this technical response document?",
+            "required_terms": "16|sixteen",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+        {
+            "test_id": "T14-003",
+            "query": "What in-process controls are described in this manufacturing document?",
+            "required_terms": "bioburden|endotoxin|action limit|sampling",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T14-004",
+            "query": "What validated process is described for product shipping?",
+            "required_terms": "shipping|temperature|validated|cold chain",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T14-005",
+            "query": "What BLA number does this manufacturing technical document relate to?",
+            "required_terms": "125742|BLA",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "high",
+        },
+        {
+            "test_id": "T14-006",
+            "query": "When was this manufacturing technical document approved?",
+            "required_terms": "30 July 2021|July 2021|30-Jul|2021",
+            "min_sources": 1,
+            "classify": False,
+            "criticality": "medium",
+        },
+    ]
+
+
 def build_combined_suite() -> list[dict]:
     """Combine all PDF per-document suites into a single regression suite."""
     return (
@@ -769,6 +1084,11 @@ def build_combined_suite() -> list[dict]:
         + suite_test7()
         + suite_test8()
         + suite_test9()
+        + suite_test10()
+        + suite_test11()
+        + suite_test12()
+        + suite_test13()
+        + suite_test14()
     )
 
 
@@ -794,6 +1114,14 @@ def main() -> int:
     if args.model_path:
         pipeline_kwargs["model_path"] = args.model_path
 
+    index_dir = args.index_dir or ""
+    if index_dir:
+        pipeline_kwargs["persist_dir"] = index_dir
+        index_path = Path(index_dir)
+        index_exists = index_path.exists() and any(index_path.iterdir())
+    else:
+        index_exists = False
+
     # ------------------------------------------------------------------
     # Phase 1: PDF regression suite
     # ------------------------------------------------------------------
@@ -802,12 +1130,19 @@ def main() -> int:
         print(f"ERROR: No PDF files found in {docs_dir.resolve()}", file=sys.stderr)
         return 1
 
-    print(f"Indexing {len(pdf_files)} PDF(s):")
-    for p in pdf_files:
-        print(f"  {p}")
+    if index_exists:
+        print(f"Loading cached index from {index_dir} (skipping PDF ingestion and LLM classification).")
+    else:
+        print(f"Indexing {len(pdf_files)} PDF(s):")
+        for p in pdf_files:
+            print(f"  {p}")
 
     rag = RAGPipeline(**pipeline_kwargs)
-    rag.build_from_multiple_pdfs([str(p) for p in pdf_files], classify_docs=True)
+    rag.build_from_multiple_pdfs(
+        [str(p) for p in pdf_files],
+        classify_docs=True,
+        force_rebuild=not index_exists,
+    )
 
     harness = RAGRegressionHarness(rag)
     suite_df = harness.create_test_suite(build_combined_suite())
@@ -830,6 +1165,14 @@ def main() -> int:
 
     print(f"\nSaved PDF results CSV  : {results_csv}")
     print(f"Saved PDF dashboard PNG: {dashboard_png}")
+
+    exit_code = 0
+    if summary.get("failed_tests", 0) > 0:
+        print(
+            f"ERROR: {summary['failed_tests']} PDF test(s) failed.",
+            file=sys.stderr,
+        )
+        exit_code = 1
 
     # ------------------------------------------------------------------
     # Phase 2: Image (OCR) regression suite
@@ -880,6 +1223,13 @@ def main() -> int:
 
             print(f"\nSaved OCR results CSV  : {image_csv}")
             print(f"Saved OCR dashboard PNG: {image_png}")
+
+            if img_summary.get("failed_tests", 0) > 0:
+                print(
+                    f"ERROR: {img_summary['failed_tests']} OCR test(s) failed.",
+                    file=sys.stderr,
+                )
+                exit_code = 1
     else:
         print(f"\nNo image_test_* folders found in {docs_dir.resolve()} — skipping OCR phase.")
 
@@ -895,10 +1245,14 @@ def main() -> int:
         comparison_df.to_csv(comparison_csv, index=False)
         harness.visualize_comparison(comparison_df, str(comparison_png))
 
+        regressions = int(comparison_df["regression_detected"].sum())
         print(f"Saved comparison CSV: {comparison_csv}")
         print(f"Saved comparison PNG: {comparison_png}")
+        if regressions > 0:
+            print(f"ERROR: {regressions} regression(s) detected vs baseline.", file=sys.stderr)
+            exit_code = 1
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

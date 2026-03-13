@@ -20,8 +20,14 @@ import matplotlib
 
 matplotlib.use("Agg")
 import pandas as pd
+import pytest
 
 from rag.regression import RAGRegressionHarness
+
+# All tests in this file exercise the harness mechanics via a deterministic
+# FakeRAG stub.  They are marked ``unit`` to distinguish them from
+# ``integration`` tests that require a real model and indexed documents.
+pytestmark = pytest.mark.unit
 
 
 @dataclass
@@ -340,6 +346,166 @@ MULTI_DOC_RESPONSES: Dict[str, Dict[str, Any]] = {
         "answer": "A pH value is not mentioned in this batch protocol.",
         "query_category": None,
         "sources": [],
+    },
+
+    # ---- test_10.pdf  (FDA Response Letter: RNA Integrity / CGE, 23 Jul 2021) ----
+    "What BLA number is referenced in this FDA response letter?": {
+        "answer": "This response is submitted under BLA 125742 for the COVID-19 mRNA vaccine.",
+        "query_category": None,
+        "sources": [_src("test_10.pdf", 1, 94.0)],
+    },
+    "What analytical method is the subject of this FDA information request?": {
+        "answer": "The subject is validation of RNA integrity by capillary gel electrophoresis (CGE).",
+        "query_category": None,
+        "sources": [_src("test_10.pdf", 2, 91.0)],
+    },
+    "What is the date of this FDA response letter?": {
+        "answer": "This FDA response letter is dated 23 July 2021.",
+        "query_category": None,
+        "sources": [_src("test_10.pdf", 1, 90.0)],
+    },
+    "What is the IND number referenced in this regulatory submission?": {
+        "answer": "The IND number referenced is BB-IND 19736.",
+        "query_category": None,
+        "sources": [_src("test_10.pdf", 1, 88.0)],
+    },
+    "Who is the FDA recipient named in this response letter?": {
+        "answer": "The letter is addressed to Marion Gruber, Ph.D., Director, Office of Vaccines Research and Review, FDA/CBER.",
+        "query_category": None,
+        "sources": [_src("test_10.pdf", 1, 92.0)],
+    },
+    "What vaccine product does this BLA submission cover?": {
+        "answer": "This BLA submission covers the COVID-19 mRNA vaccine BNT162 (PF-07302048).",
+        "query_category": None,
+        "sources": [_src("test_10.pdf", 1, 93.0)],
+    },
+
+    # ---- test_11.pdf  (FDA Response Letter: Sterility/Endotoxin, 30 Jul 2021) ----
+    "What BLA number is referenced in this FDA response?": {
+        "answer": "This response is submitted under BLA 125742.",
+        "query_category": None,
+        "sources": [_src("test_11.pdf", 1, 93.0)],
+    },
+    "What test methods are discussed in this FDA information request response?": {
+        "answer": "This response discusses sterility and endotoxin test methods used at the manufacturing facilities.",
+        "query_category": None,
+        "sources": [_src("test_11.pdf", 2, 91.0)],
+    },
+    "What manufacturing facilities are referenced in this document?": {
+        "answer": "The manufacturing facilities referenced are PGS-Puurs and PGS-KZO.",
+        "query_category": None,
+        "sources": [_src("test_11.pdf", 2, 90.0)],
+    },
+    "What is the date of this regulatory response letter?": {
+        "answer": "This regulatory response letter is dated 30 July 2021.",
+        "query_category": None,
+        "sources": [_src("test_11.pdf", 1, 89.0)],
+    },
+    "What is the FDA control number for this submission?": {
+        "answer": "The FDA control number for this submission is FDA-CBER-2021-5683-1149402.",
+        "query_category": None,
+        "sources": [_src("test_11.pdf", 1, 88.0)],
+    },
+    "What vaccine product does this FDA response cover?": {
+        "answer": "This response covers the COVID-19 mRNA vaccine BNT162 (PF-07302048).",
+        "query_category": None,
+        "sources": [_src("test_11.pdf", 1, 91.0)],
+    },
+
+    # ---- test_12.pdf  (Technical Response: Sterility/Endotoxin Verification) ----
+    "What analytical methods are verified in this FDA technical response?": {
+        "answer": "This technical response verifies sterility and endotoxin (LAL) testing methods, including positive product control (PPC) percent recovery data.",
+        "query_category": None,
+        "sources": [_src("test_12.pdf", 1, 92.0)],
+    },
+    "What does PPC stand for in this endotoxin testing document?": {
+        "answer": "PPC stands for positive product control.",
+        "query_category": None,
+        "sources": [_src("test_12.pdf", 2, 90.0)],
+    },
+    "Which testing facilities are mentioned in this sterility and endotoxin verification?": {
+        "answer": "The testing facilities are PGS-Puurs and PGS-KZO.",
+        "query_category": None,
+        "sources": [_src("test_12.pdf", 2, 91.0)],
+    },
+    "What is the BLA number associated with this technical document?": {
+        "answer": "This technical document is associated with BLA 125742.",
+        "query_category": None,
+        "sources": [_src("test_12.pdf", 1, 93.0)],
+    },
+    "What method is used for endotoxin testing in this document?": {
+        "answer": "Endotoxin testing uses the LAL (Limulus Amebocyte Lysate) method.",
+        "query_category": None,
+        "sources": [_src("test_12.pdf", 2, 90.0)],
+    },
+    "When was this technical document approved or submitted?": {
+        "answer": "This technical document was approved on 29 July 2021.",
+        "query_category": None,
+        "sources": [_src("test_12.pdf", 1, 88.0)],
+    },
+
+    # ---- test_13.pdf  (FDA Response Letter: Manufacturing/Equipment, 30 Jul 2021) ----
+    "What is the subject of this FDA information request response?": {
+        "answer": "This response addresses FDA queries regarding manufacturing and equipment for BLA 125742.",
+        "query_category": None,
+        "sources": [_src("test_13.pdf", 1, 92.0)],
+    },
+    "What BLA number is cited in this regulatory submission?": {
+        "answer": "This regulatory submission is filed under BLA 125742.",
+        "query_category": None,
+        "sources": [_src("test_13.pdf", 1, 93.0)],
+    },
+    "What is the date of this FDA manufacturing response letter?": {
+        "answer": "This FDA manufacturing response letter is dated 30 July 2021.",
+        "query_category": None,
+        "sources": [_src("test_13.pdf", 1, 90.0)],
+    },
+    "Who is the FDA contact person referenced in this letter?": {
+        "answer": "The FDA contact person is Laura Gottschalk, PhD, CBER/OVRR.",
+        "query_category": None,
+        "sources": [_src("test_13.pdf", 1, 89.0)],
+    },
+    "Who is the applicant or sender named in this BLA response?": {
+        "answer": "The applicant is Pharmacia & Upjohn Company LLC for BioNTech Manufacturing GmbH.",
+        "query_category": None,
+        "sources": [_src("test_13.pdf", 1, 91.0)],
+    },
+    "What is the original BLA submission date mentioned in this letter?": {
+        "answer": "The original BLA was submitted on 18 May 2021.",
+        "query_category": None,
+        "sources": [_src("test_13.pdf", 1, 88.0)],
+    },
+
+    # ---- test_14.pdf  (Technical Response: Manufacturing/Equipment, 26 Jul 2021) ----
+    "What testing parameters are addressed in this manufacturing technical response?": {
+        "answer": "This document addresses bioburden testing, endotoxin action limits, and manufacturing hold times.",
+        "query_category": None,
+        "sources": [_src("test_14.pdf", 2, 91.0)],
+    },
+    "How many FDA queries are addressed in this technical response document?": {
+        "answer": "This technical response document addresses 16 FDA queries.",
+        "query_category": None,
+        "sources": [_src("test_14.pdf", 1, 90.0)],
+    },
+    "What in-process controls are described in this manufacturing document?": {
+        "answer": "In-process controls include bioburden sampling and endotoxin testing with defined action limits and investigation protocols for exceedances.",
+        "query_category": None,
+        "sources": [_src("test_14.pdf", 3, 92.0)],
+    },
+    "What validated process is described for product shipping?": {
+        "answer": "A validated temperature-monitored shipping method is described for product distribution.",
+        "query_category": None,
+        "sources": [_src("test_14.pdf", 4, 89.0)],
+    },
+    "What BLA number does this manufacturing technical document relate to?": {
+        "answer": "This manufacturing technical document relates to BLA 125742.",
+        "query_category": None,
+        "sources": [_src("test_14.pdf", 1, 93.0)],
+    },
+    "When was this manufacturing technical document approved?": {
+        "answer": "This manufacturing technical document was approved on 30 July 2021.",
+        "query_category": None,
+        "sources": [_src("test_14.pdf", 1, 90.0)],
     },
 }
 

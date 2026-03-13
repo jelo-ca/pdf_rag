@@ -8,6 +8,8 @@ This module provides a lightweight harness that:
 
 from __future__ import annotations
 
+import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -87,6 +89,15 @@ class RAGRegressionHarness:
         suite_df["min_sources"] = suite_df["min_sources"].map(int)
         suite_df["num_expansions"] = suite_df["num_expansions"].map(int)
 
+        unchecked = suite_df["classify"] & suite_df["expected_query_category"].isna()
+        if unchecked.any():
+            ids = suite_df.loc[unchecked, "test_id"].tolist()
+            warnings.warn(
+                f"Tests with classify=True but no expected_query_category (category will not be "
+                f"validated): {ids}",
+                stacklevel=2,
+            )
+
         return suite_df
 
     def run(self, test_suite: pd.DataFrame) -> pd.DataFrame:
@@ -94,14 +105,15 @@ class RAGRegressionHarness:
         rows: List[Dict[str, Any]] = []
 
         for _, test in test_suite.iterrows():
-            started = datetime.now(timezone.utc)
+            t0 = time.perf_counter()
             payload = self.rag.query_with_sources(
                 test["query"],
                 classify=bool(test["classify"]),
                 expand=bool(test["expand"]),
                 num_expansions=int(test["num_expansions"]),
             )
-            ended = datetime.now(timezone.utc)
+            t1 = time.perf_counter()
+            timestamp = datetime.now(timezone.utc)
 
             answer = str(payload.get("answer", ""))
             sources = payload.get("sources", []) or []
@@ -116,7 +128,7 @@ class RAGRegressionHarness:
             terms_ok = self._required_terms_match(answer, str(test.get("required_terms", "")))
 
             row = {
-                "timestamp": ended,
+                "timestamp": timestamp,
                 "test_id": test["test_id"],
                 "criticality": test.get("criticality", "medium"),
                 "query": test["query"],
@@ -125,7 +137,7 @@ class RAGRegressionHarness:
                 "query_category": query_category,
                 "num_sources": len(sources),
                 "avg_confidence": round(avg_confidence, 3),
-                "response_time_ms": (ended - started).total_seconds() * 1000.0,
+                "response_time_ms": (t1 - t0) * 1000.0,
                 "has_min_sources": has_min_sources,
                 "category_match": category_ok,
                 "required_terms_match": terms_ok,
@@ -155,6 +167,21 @@ class RAGRegressionHarness:
             raise ValueError(f"current_results missing columns: {', '.join(missing_current)}")
         if missing_baseline:
             raise ValueError(f"baseline_results missing columns: {', '.join(missing_baseline)}")
+
+        current_ids = set(current_results["test_id"])
+        baseline_ids = set(baseline_results["test_id"])
+        new_ids = sorted(current_ids - baseline_ids)
+        dropped_ids = sorted(baseline_ids - current_ids)
+        if new_ids:
+            warnings.warn(
+                f"Test IDs in current run but not in baseline (excluded from comparison): {new_ids}",
+                stacklevel=2,
+            )
+        if dropped_ids:
+            warnings.warn(
+                f"Test IDs in baseline but not in current run (excluded from comparison): {dropped_ids}",
+                stacklevel=2,
+            )
 
         merged = current_results.merge(
             baseline_results[merge_columns],
@@ -345,11 +372,28 @@ class RAGRegressionHarness:
 
     @staticmethod
     def _required_terms_match(answer: str, required_terms: str) -> bool:
-        terms = [t.strip().lower() for t in required_terms.split("|") if t.strip()]
-        if not terms:
+        """Check whether the answer satisfies the required_terms expression.
+
+        Pipe (``|``) separates OR alternatives; any one matching group is
+        sufficient.  Comma (``,``) joins AND requirements within a group; all
+        comma-separated substrings must appear for that group to match.
+
+        Examples::
+
+            "batch|lot"          → passes if "batch" OR "lot" is present
+            "batch,lot"          → passes only if BOTH "batch" AND "lot" are present
+            "H401,H411|aquatic"  → passes if (H401 AND H411) OR "aquatic" is present
+        """
+        if not required_terms:
             return True
         answer_lower = answer.lower()
-        return any(term in answer_lower for term in terms)
+        or_groups = [g.strip() for g in required_terms.split("|") if g.strip()]
+        if not or_groups:
+            return True
+        return any(
+            all(part.strip().lower() in answer_lower for part in group.split(",") if part.strip())
+            for group in or_groups
+        )
 
     @staticmethod
     def _answer_similarity(answer_a: str, answer_b: str) -> float:

@@ -16,6 +16,20 @@ When the packages *are* installed (local dev), the real modules are used.
 import sys
 from unittest.mock import MagicMock
 
+import pytest
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register custom markers so pytest does not emit PytestUnknownMarkWarning."""
+    config.addinivalue_line(
+        "markers",
+        "unit: harness-unit test using a deterministic fake pipeline (no real model required)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "integration: true pipeline accuracy test requiring a real model and indexed documents",
+    )
+
 # ---------------------------------------------------------------------------
 # Check whether the heavy stack is available; if not, inject stubs.
 # ---------------------------------------------------------------------------

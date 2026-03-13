@@ -57,6 +57,9 @@ def main() -> int:
     print(f"Compared {len(comparison_df)} test(s). Regressions detected: {regressions}")
     print(f"Saved comparison CSV: {comparison_csv}")
     print(f"Saved comparison PNG: {comparison_png}")
+    if regressions > 0:
+        print(f"ERROR: {regressions} regression(s) detected — exiting with code 1.", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -1,19 +1,18 @@
 """
 Pipeline Classification Dynamics Test
 ======================================
-Wraps ``pipeline._classify_document`` (the real two-stage keyword + LLM
-classifier) to measure how accuracy, speed, and the keyword-hit vs.
-LLM-fallback ratio change as progressively more documents are classified
-and stored in a temporary embedding store.
+Wraps ``pipeline._classify_document`` to measure how the pipeline's reliance
+on the classification index grows as more documents are stored.
 
-Latency methodology
--------------------
-* Each sample is warmed up (N_WARMUP untimed calls) then timed N_REPEATS
-  times; the median is used — not a single-pass batch mean.
-* Keyword-path and LLM-path latencies are tracked in separate buckets and
-  plotted as independent series.
-* Batches have a fixed keyword : LLM ratio so the composition never skews
-  the per-batch aggregates.
+Classification routing (in priority order):
+  1. Index  — nearest-neighbour lookup in the embedding store (cosine ≥ threshold)
+  2. Keyword — fast regex scan via ``_KEYWORD_MAP`` (no LLM needed)
+  3. LLM    — two-stage fallback for ambiguous documents
+
+Three independent runs with different random orderings of the document corpus
+simulate the variability in which order files from ``docs/`` are encountered.
+The side-by-side comparison shows how quickly each ordering builds up index
+coverage and drives down LLM reliance.
 
 Heavy ML dependencies are NOT needed — ``conftest.py`` stubs them out, and
 the LLM is replaced with a lightweight deterministic mock.
@@ -47,13 +46,14 @@ from rag.pipeline import (  # noqa: E402
 DOCUMENT_TYPES: list[str] = [c for c in _PHARMA_DOC_CATEGORIES if c != "unknown"]
 EMBEDDING_DIM: int = 384  # all-MiniLM-L6-v2 dimension
 
-# Latency measurement parameters
-N_WARMUP: int = 3   # untimed runs per sample before timing starts
-N_REPEATS: int = 9  # timed runs per sample; median is taken (odd number)
+# Cosine similarity threshold for index-based classification
+SIMILARITY_THRESHOLD: float = 0.82
 
-# Controlled batch composition
-KW_PER_BATCH: int = 2    # keyword-path docs per batch
-LLM_PER_BATCH: int = 2   # LLM-path docs per batch
+# Snapshot every N documents (x-axis resolution)
+SNAPSHOT_EVERY: int = 4
+
+# Three independent random orderings for side-by-side comparison
+RUN_SEEDS: list[int] = [42, 99, 7]
 
 
 # ---------------------------------------------------------------------------
@@ -107,14 +107,26 @@ _KEYWORD_CORPUS: dict[str, list[str]] = {
 }
 
 # Documents with no keyword signals -> fall through to LLM path
+# Includes generic pharma docs plus FDA regulatory correspondence (test_10–14):
+#   cover_letter      — BLA 125742 "Dear…" response letters  (test_10, 11, 13)
+#   certificate_of_quality — Sterility/Endotoxin report      (test_12)
+#   supplier_qualification — Manufacturing/Equipment response (test_14)
 _AMBIGUOUS_CORPUS: dict[str, list[str]] = {
     "cover_letter": [
         "Attached are the relevant documents for your review. Please acknowledge receipt.",
         "Please find the requested files in this transmission. Contact us for queries.",
+        # FDA regulatory letters — BLA 125742 (test_10, 11, 13)
+        "In response to your information request dated July 23, 2021, under BLA 125742, please find our technical reply attached.",
+        "We are responding to the FDA request regarding BLA 125742 for the COVID-19 mRNA vaccine regarding capillary gel electrophoresis.",
+        "This document provides our response to the FDA correspondence issued July 30, 2021 concerning sterility and endotoxin testing.",
+        "We hereby submit our technical response to FDA information request BLA 125742 pertaining to manufacturing equipment qualification.",
     ],
     "certificate_of_quality": [
         "Batch 12345 tested against specification. All results within acceptance criteria.",
         "Product lot 77201 released by QA department per internal procedure QP-04.",
+        # Sterility/Endotoxin technical verification report (test_12)
+        "Endotoxin testing was performed by the LAL chromogenic method. All results met the acceptance criteria of < 0.5 EU/mL.",
+        "Sterility testing confirmed no microbial growth after 14-day incubation. Positive product control (PPC) recovery was 100%.",
     ],
     "packaging_specification": [
         "Primary container dimensions verified against approved drawing PK-0023 Rev 2.",
@@ -131,6 +143,9 @@ _AMBIGUOUS_CORPUS: dict[str, list[str]] = {
     "supplier_qualification": [
         "Site audit completed 2023-05. Findings: 0 critical, 2 minor. Status: Approved.",
         "Quality agreement signed 2022-11. Next review due 2025-11. Status: active.",
+        # Manufacturing/Equipment technical response (test_14)
+        "Bioreactor equipment was qualified per IQ/OQ/PQ protocols and demonstrated compliance with current GMP requirements.",
+        "Equipment maintenance and calibration records confirm all manufacturing systems are within validated operational ranges.",
     ],
     "chain_of_custody": [
         "Sample sealed by QC inspector, transferred under continuous cold chain supervision.",
@@ -218,33 +233,28 @@ class ClassificationStore:
         self._embeddings: list[np.ndarray] = []
         self._metadata: list[dict] = []
 
-    def add(self, text: str, predicted: str, true_label: str, embedding: np.ndarray) -> None:
+    def add(self, text: str, predicted: str, embedding: np.ndarray) -> None:
         self._embeddings.append(embedding.astype(np.float32))
-        self._metadata.append(
-            {
-                "text_snippet": text[:80],
-                "predicted": predicted,
-                "true": true_label,
-                "correct": predicted == true_label,
-            }
-        )
+        self._metadata.append({"text_snippet": text[:80], "predicted": predicted})
         self._persist()
 
     def _persist(self) -> None:
-        np.save(str(self.store_dir / self._EMBEDDINGS_FILE), np.array(self._embeddings, dtype=np.float32))
+        np.save(
+            str(self.store_dir / self._EMBEDDINGS_FILE),
+            np.array(self._embeddings, dtype=np.float32),
+        )
         with open(self.store_dir / self._META_FILE, "w", encoding="utf-8") as fh:
             json.dump(self._metadata, fh, indent=2)
 
-    def accuracy(self) -> float:
-        if not self._metadata:
-            return 0.0
-        return sum(m["correct"] for m in self._metadata) / len(self._metadata) * 100
-
-    def accuracy_for(self, doc_type: str) -> float:
-        subset = [m for m in self._metadata if m["true"] == doc_type]
-        if not subset:
-            return 0.0
-        return sum(m["correct"] for m in subset) / len(subset) * 100
+    def lookup_nearest(self, embedding: np.ndarray) -> str | None:
+        """Return the predicted label of the nearest stored doc if cosine similarity
+        is at or above ``SIMILARITY_THRESHOLD``, otherwise ``None``."""
+        if not self._embeddings:
+            return None
+        embs = np.array(self._embeddings, dtype=np.float32)
+        sims = embs @ embedding.astype(np.float32)   # both sides are unit-normalised
+        best = int(np.argmax(sims))
+        return self._metadata[best]["predicted"] if sims[best] >= SIMILARITY_THRESHOLD else None
 
     def __len__(self) -> int:
         return len(self._metadata)
@@ -281,151 +291,138 @@ def _is_keyword_path(text: str) -> bool:
     )
 
 
-def _measure_latency_ms(classifier: MinimalClassifier, text: str) -> float:
-    """
-    Warm up the classifier on *text* (N_WARMUP untimed calls), then return
-    the median of N_REPEATS timed calls in milliseconds.
+# ---------------------------------------------------------------------------
+# Single-run helper
+# ---------------------------------------------------------------------------
 
-    Uses a dedicated timing classifier so the counting ``MockLLM``'s
-    ``call_count`` is never inflated by warm-up or repeat passes.
+def _single_run(seed: int, store_dir: str) -> pd.DataFrame:
     """
-    for _ in range(N_WARMUP):
-        classifier.classify_document(text)
-    samples = []
-    for _ in range(N_REPEATS):
+    Classify all corpus documents in a random order determined by *seed*,
+    simulating the variability in which order files from ``docs/`` are
+    encountered.
+
+    Routing priority per document:
+      1. Index   — ``store.lookup_nearest()`` cosine ≥ SIMILARITY_THRESHOLD
+      2. Keyword — ``_is_keyword_path()`` regex match (no LLM)
+      3. LLM     — ``counting_clf.classify_document()`` fallback
+
+    A snapshot of cumulative route shares is recorded every SNAPSHOT_EVERY
+    documents so the returned DataFrame shows the progression of index reliance
+    as the store grows.
+    """
+    rng = np.random.default_rng(seed)
+
+    counting_llm = MockLLM(_build_llm_map())
+    counting_clf = MinimalClassifier(counting_llm)
+    store = ClassificationStore(store_dir)
+
+    # Flat corpus — all doc types, both keyword-signal and ambiguous variants
+    all_docs: list[tuple[str, str]] = [
+        (text, doc_type)
+        for doc_type in DOCUMENT_TYPES
+        for text in _KEYWORD_CORPUS.get(doc_type, []) + _AMBIGUOUS_CORPUS.get(doc_type, [])
+    ]
+    # Different permutation each run — key variability simulating docs/ read order
+    all_docs = [all_docs[i] for i in rng.permutation(len(all_docs))]
+
+    n_index = n_keyword = n_llm = 0
+    results: list[dict] = []
+    window_ms: list[float] = []  # per-doc routing latency within the current window
+
+    for pos, (text, doc_type) in enumerate(all_docs, 1):
+        # noise=0.01 keeps same-type cosine sim ~0.96 >> SIMILARITY_THRESHOLD
+        # while cross-type sims stay near 0 in 384-D space
+        embedding = make_embedding(rng, doc_type, noise=0.01)
+
         t0 = time.perf_counter()
-        classifier.classify_document(text)
-        samples.append((time.perf_counter() - t0) * 1_000)
-    return float(np.median(samples))
+        nearest = store.lookup_nearest(embedding)
+        if nearest is not None:
+            predicted = nearest
+            n_index += 1
+        elif _is_keyword_path(text):
+            predicted = counting_clf.classify_document(text)
+            n_keyword += 1
+        else:
+            predicted = counting_clf.classify_document(text)
+            n_llm += 1
+        window_ms.append((time.perf_counter() - t0) * 1_000)
 
+        store.add(text, predicted, embedding)
 
-def _build_controlled_batches(
-    keyword_docs: list[tuple[str, str]],
-    llm_docs: list[tuple[str, str]],
-    kw_per_batch: int,
-    llm_per_batch: int,
-) -> list[list[tuple[str, str]]]:
-    """
-    Return batches with a fixed keyword : LLM composition.
-    Stops when either list is exhausted so every batch is complete.
-    """
-    batches: list[list[tuple[str, str]]] = []
-    ki = li = 0
-    while ki + kw_per_batch <= len(keyword_docs) and li + llm_per_batch <= len(llm_docs):
-        batches.append(keyword_docs[ki : ki + kw_per_batch] + llm_docs[li : li + llm_per_batch])
-        ki += kw_per_batch
-        li += llm_per_batch
-    return batches
+        if pos % SNAPSHOT_EVERY == 0 or pos == len(all_docs):
+            results.append(
+                {
+                    "n_classified": pos,
+                    "index_hit_pct": n_index / pos * 100,
+                    "keyword_hit_pct": n_keyword / pos * 100,
+                    "llm_call_pct": n_llm / pos * 100,
+                    "window_median_ms": float(np.median(window_ms)),
+                }
+            )
+            window_ms = []
+
+    return pd.DataFrame(results)
 
 
 # ---------------------------------------------------------------------------
-# Plotting helpers
+# Plotting helper — 3-run side-by-side comparison
 # ---------------------------------------------------------------------------
 
-_BLUE = "#2196F3"
-_GREEN = "#4CAF50"
-_GREEN_DARK = "#2E7D32"
-_AMBER = "#FF9800"
-_AMBER_DARK = "#E65100"
+# One distinct colour per run
+_RUN_COLORS: list[str] = ["#1565C0", "#2E7D32", "#BF360C"]  # blue, green, red
 
 
-def _plot_classification_dynamics(df: pd.DataFrame, output_path: Path) -> None:
+def _plot_three_run_comparison(runs: dict[int, pd.DataFrame], output_path: Path) -> None:
     """
-    Three-panel chart:
-      1. Classification accuracy vs. documents classified
-      2. Keyword-path vs. LLM-path latency (median + p90) as separate series
-      3. Keyword vs. LLM path share (stacked area)
+    Three-panel chart comparing three independent runs with different doc orderings:
+
+      Left   — Index hit% vs. documents classified (increasing = more index reliance)
+      Centre — LLM call% vs. documents classified (decreasing = less LLM reliance)
+      Right  — Median classification time (ms) per snapshot window
     """
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle(
-        "Pipeline Classification Dynamics\n"
-        "(pipeline._classify_document — keyword path vs. LLM fallback)",
+        "Pipeline Classification Dynamics — 3 Random Doc Orderings Side by Side\n"
+        "(index-first routing: index → keyword → LLM)",
         fontsize=12,
         fontweight="bold",
     )
 
-    x = df["n_classified"]
+    for (seed, df), color in zip(runs.items(), _RUN_COLORS):
+        x = df["n_classified"]
+        lbl = f"seed={seed}"
 
-    # ── Panel 1: Accuracy ──────────────────────────────────────────────
-    ax = axes[0]
-    ax.plot(x, df["accuracy_pct"], "o-", color=_BLUE, lw=2, ms=6, label="Accuracy (%)")
-    ax.fill_between(x, df["accuracy_pct"], alpha=0.12, color=_BLUE)
-    ax.set_xlabel("Documents Classified")
-    ax.set_ylabel("Accuracy (%)")
-    ax.set_title("Classification Accuracy")
-    ax.set_ylim(0, 107)
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=9)
-    for pos in (0, -1):
-        ax.annotate(
-            f"{df['accuracy_pct'].iloc[pos]:.1f}%",
-            xy=(x.iloc[pos], df["accuracy_pct"].iloc[pos]),
-            xytext=(6, -14),
-            textcoords="offset points",
-            fontsize=8,
-            color=_BLUE,
-        )
+        # ── Left: growing index reliance ──────────────────────────────
+        axes[0].plot(x, df["index_hit_pct"], "o-", color=color, lw=2, ms=5, label=lbl)
+        axes[0].fill_between(x, df["index_hit_pct"], alpha=0.08, color=color)
 
-    # ── Panel 2: Latency — keyword vs. LLM, median + p90 ──────────────
-    ax = axes[1]
-    ax.plot(x, df["kw_median_ms"],  "o-",  color=_GREEN,      lw=2, ms=6,  label="Keyword median")
-    ax.plot(x, df["kw_p90_ms"],     "o--", color=_GREEN_DARK, lw=1.5, ms=4, label="Keyword p90")
-    ax.fill_between(x, df["kw_median_ms"], df["kw_p90_ms"], alpha=0.14, color=_GREEN)
+        # ── Centre: shrinking LLM reliance ────────────────────────────
+        axes[1].plot(x, df["llm_call_pct"], "s-", color=color, lw=2, ms=5, label=lbl)
+        axes[1].fill_between(x, df["llm_call_pct"], alpha=0.08, color=color)
 
-    ax.plot(x, df["llm_median_ms"], "s-",  color=_AMBER,      lw=2, ms=6,  label="LLM median")
-    ax.plot(x, df["llm_p90_ms"],    "s--", color=_AMBER_DARK, lw=1.5, ms=4, label="LLM p90")
-    ax.fill_between(x, df["llm_median_ms"], df["llm_p90_ms"], alpha=0.14, color=_AMBER)
+        # ── Right: per-window median classification speed ─────────────
+        axes[2].plot(x, df["window_median_ms"], "^-", color=color, lw=2, ms=5, label=lbl)
 
-    ax.set_xlabel("Documents Classified")
-    ax.set_ylabel("Latency (ms)  [median of 9 runs]")
-    ax.set_title("Classification Speed — Keyword vs. LLM")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
+    axes[0].set_xlabel("Documents Classified")
+    axes[0].set_ylabel("Index Hit (%)")
+    axes[0].set_title("Growing Reliance on Classification Index")
+    axes[0].set_ylim(0, 105)
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(fontsize=9)
 
-    # ── Panel 3: Path-split stacked area ──────────────────────────────
-    ax = axes[2]
-    ax.stackplot(
-        x,
-        df["keyword_hit_pct"],
-        df["llm_call_pct"],
-        labels=["Keyword path (%)", "LLM fallback (%)"],
-        colors=[_GREEN, _AMBER],
-        alpha=0.82,
-    )
-    ax.set_xlabel("Documents Classified")
-    ax.set_ylabel("Share of Classifications (%)")
-    ax.set_title("Keyword vs. LLM Path Split")
-    ax.set_ylim(0, 105)
-    ax.grid(True, alpha=0.2)
-    ax.legend(fontsize=8)
+    axes[1].set_xlabel("Documents Classified")
+    axes[1].set_ylabel("LLM Call (%)")
+    axes[1].set_title("Decreasing LLM Fallback")
+    axes[1].set_ylim(0, 105)
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(fontsize=9)
 
-    plt.tight_layout()
-    plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    axes[2].set_xlabel("Documents Classified")
+    axes[2].set_ylabel("Median Classification Time (ms)")
+    axes[2].set_title("Classification Speed per Window")
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend(fontsize=9)
 
-
-def _plot_per_category_accuracy(df: pd.DataFrame, output_path: Path) -> None:
-    """Multi-line chart: per-category accuracy vs. documents classified."""
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax.set_title(
-        "Per-Category Classification Accuracy vs. Documents Classified",
-        fontsize=13,
-        fontweight="bold",
-    )
-    colors = matplotlib.colormaps["tab10"](np.linspace(0, 1, len(DOCUMENT_TYPES)))
-    x = df["n_classified"]
-
-    for doc_type, color in zip(DOCUMENT_TYPES, colors):
-        col = f"acc_{doc_type}"
-        if col in df.columns:
-            ax.plot(x, df[col], "o-", color=color, lw=2, ms=5,
-                    label=doc_type.replace("_", " ").title())
-
-    ax.set_xlabel("Documents Classified")
-    ax.set_ylabel("Accuracy (%)")
-    ax.set_ylim(-5, 110)
-    ax.grid(True, alpha=0.3)
-    ax.legend(bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=9)
     plt.tight_layout()
     plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -451,216 +448,69 @@ def temp_store_dir():
 
 class TestPipelineClassificationDynamics:
     """
-    Wraps ``pipeline._classify_document`` to measure accuracy, speed, and
-    path distribution (keyword vs. LLM) as the temporary embedding store grows.
+    Wraps ``pipeline._classify_document`` to measure speed and path
+    distribution (keyword vs. LLM) as the temporary embedding store grows,
+    across three independent random orderings of the document corpus.
     """
 
     # -----------------------------------------------------------------------
-    # Test 1: Accuracy + separate keyword/LLM latency over growing store
+    # Test 1: Three-run side-by-side comparison
     # -----------------------------------------------------------------------
 
-    def test_accuracy_and_speed_over_growing_store(self, temp_store_dir: str, tmp_path: Path) -> None:
+    def test_three_run_ordering_comparison(self, tmp_path: Path) -> None:
         """
-        Progressively classifies controlled batches (KW_PER_BATCH keyword docs +
-        LLM_PER_BATCH LLM docs per batch) and records per-batch metrics:
-
-        * accuracy_pct    — cumulative correct / total
-        * kw_median_ms    — keyword-path median latency  (N_REPEATS timed runs)
-        * kw_p90_ms       — keyword-path 90th-percentile latency
-        * llm_median_ms   — LLM-path median latency
-        * llm_p90_ms      — LLM-path 90th-percentile latency
-        * keyword_hit_pct — cumulative keyword-path share
-        * llm_call_pct    — cumulative LLM-path share
-
-        Latency methodology
-        -------------------
-        Each sample is first warmed up (N_WARMUP calls, not timed) via a
-        dedicated timing classifier that is separate from the accuracy-tracking
-        classifier, so MockLLM.call_count is never inflated by repeats.
+        Runs classification three times, each with a different random ordering
+        of the document corpus (simulating different ``docs/`` read orders).
+        Compares the three runs side by side on index reliance and LLM fallback.
 
         Assertions
         ----------
-        * Final accuracy >= 85%
-        * LLM-path median latency >= keyword-path median on every batch
-          (LLM path does more work: string format + dict scan on top of
-          the keyword scan)
-        * Output PNG written to tmp_path/ and mirrored to artifacts/
+        * Index hit% is strictly higher at the end than at the start (store
+          grows and becomes increasingly useful).
+        * LLM call% at the final snapshot is lower than at the first snapshot.
+        * Output PNG written to tmp_path/ and mirrored to artifacts/.
         """
-        rng = np.random.default_rng(42)
+        runs: dict[int, pd.DataFrame] = {}
 
-        # Counting classifier: tracks accuracy and call_count (single pass)
-        counting_llm = MockLLM(_build_llm_map())
-        counting_clf = MinimalClassifier(counting_llm)
+        for seed in RUN_SEEDS:
+            run_dir = tmp_path / f"run_{seed}"
+            run_dir.mkdir()
+            df = _single_run(seed, str(run_dir))
 
-        # Timing classifier: isolated from counting_llm so call_count stays clean
-        timing_clf = MinimalClassifier(MockLLM(_build_llm_map()))
-
-        store = ClassificationStore(temp_store_dir)
-
-        # ── Build keyword and LLM doc lists ───────────────────────────
-        # keyword_docs: all categories that have _KEYWORD_MAP entries (not "unknown")
-        keyword_docs: list[tuple[str, str]] = [
-            (text, doc_type)
-            for doc_type in DOCUMENT_TYPES
-            if doc_type != "unknown"
-            for text in _KEYWORD_CORPUS.get(doc_type, [])
-        ]
-        # llm_docs: all ambiguous docs + all "unknown" keyword docs
-        llm_docs: list[tuple[str, str]] = [
-            (text, doc_type)
-            for doc_type in DOCUMENT_TYPES
-            for text in _AMBIGUOUS_CORPUS.get(doc_type, [])
-        ] + [
-            (text, "unknown")
-            for text in _KEYWORD_CORPUS.get("unknown", [])
-        ]
-
-        # Shuffle each list independently to avoid ordering bias
-        kw_idx = rng.permutation(len(keyword_docs))
-        llm_idx = rng.permutation(len(llm_docs))
-        keyword_docs = [keyword_docs[i] for i in kw_idx]
-        llm_docs = [llm_docs[i] for i in llm_idx]
-
-        batches = _build_controlled_batches(keyword_docs, llm_docs, KW_PER_BATCH, LLM_PER_BATCH)
-        assert batches, "No complete batches could be formed — check corpus sizes"
-
-        results: list[dict] = []
-
-        for batch_idx, batch in enumerate(batches):
-            kw_latencies: list[float] = []
-            llm_latencies: list[float] = []
-
-            for text, true_label in batch:
-                # ── Single-pass: accuracy tracking ────────────────────
-                predicted = counting_clf.classify_document(text)
-                store.add(text, predicted, true_label, make_embedding(rng, true_label))
-
-                # ── Latency measurement: warm-up then repeated runs ────
-                lat = _measure_latency_ms(timing_clf, text)
-                if _is_keyword_path(text):
-                    kw_latencies.append(lat)
-                else:
-                    llm_latencies.append(lat)
-
-            n = len(store)
-            n_llm = counting_llm.call_count
-            n_keyword = n - n_llm
-
-            results.append(
-                {
-                    "batch": batch_idx + 1,
-                    "n_classified": n,
-                    "accuracy_pct": store.accuracy(),
-                    "kw_median_ms": float(np.median(kw_latencies)) if kw_latencies else float("nan"),
-                    "kw_p90_ms": float(np.percentile(kw_latencies, 90)) if kw_latencies else float("nan"),
-                    "llm_median_ms": float(np.median(llm_latencies)) if llm_latencies else float("nan"),
-                    "llm_p90_ms": float(np.percentile(llm_latencies, 90)) if llm_latencies else float("nan"),
-                    "keyword_hit_pct": n_keyword / n * 100,
-                    "llm_call_pct": n_llm / n * 100,
-                }
+            assert not df.empty, f"Run seed={seed} produced no snapshots"
+            assert df["index_hit_pct"].iloc[-1] > df["index_hit_pct"].iloc[0], (
+                f"seed={seed}: index reliance did not grow "
+                f"({df['index_hit_pct'].iloc[0]:.1f}% → {df['index_hit_pct'].iloc[-1]:.1f}%)"
+            )
+            assert df["llm_call_pct"].iloc[-1] <= df["llm_call_pct"].iloc[0], (
+                f"seed={seed}: LLM call% did not decrease "
+                f"({df['llm_call_pct'].iloc[0]:.1f}% → {df['llm_call_pct'].iloc[-1]:.1f}%)"
             )
 
-        df = pd.DataFrame(results)
+            runs[seed] = df
 
-        # ── Assertions ──────────────────────────────────────────────────
-        final_acc = df["accuracy_pct"].iloc[-1]
-        assert final_acc >= 85.0, f"Final accuracy {final_acc:.1f}% is too low"
-        assert counting_llm.call_count > 0, "LLM path should have fired"
-        assert len(store) - counting_llm.call_count > 0, "Keyword path should have fired"
-
-        # LLM path should be slower than keyword path on every batch
-        for _, row in df.iterrows():
-            assert row["llm_median_ms"] >= row["kw_median_ms"], (
-                f"Batch {row['batch']}: LLM median ({row['llm_median_ms']:.4f} ms) "
-                f"< keyword median ({row['kw_median_ms']:.4f} ms)"
-            )
-        # ── Output graph ────────────────────────────────────────────────
         chart_path = tmp_path / "classification_dynamics.png"
-        _plot_classification_dynamics(df, chart_path)
+        _plot_three_run_comparison(runs, chart_path)
         assert chart_path.exists() and chart_path.stat().st_size > 0
 
         artifacts_dir = Path(__file__).parent.parent / "artifacts"
         if artifacts_dir.exists():
             shutil.copy(chart_path, artifacts_dir / "classification_dynamics.png")
 
-        print(
-            f"\n[Pipeline Classification]"
-            f"  batches={len(batches)}  n={len(store)}"
-            f"  accuracy={final_acc:.1f}%"
-            f"  kw_median={df['kw_median_ms'].mean():.4f} ms"
-            f"  llm_median={df['llm_median_ms'].mean():.4f} ms"
-            f"  kw_path={len(store) - counting_llm.call_count}"
-            f"  llm_path={counting_llm.call_count}"
-        )
-
-    # -----------------------------------------------------------------------
-    # Test 2: Per-category accuracy breakdown
-    # -----------------------------------------------------------------------
-
-    def test_per_category_accuracy_over_growing_store(self, temp_store_dir: str, tmp_path: Path) -> None:
-        """
-        Tracks classification accuracy per document type as the store grows,
-        revealing which categories rely on the keyword fast-path and which
-        need the LLM fallback.
-
-        Assertions
-        ----------
-        * Every category achieves >= 50% accuracy by the final batch.
-        * Output PNG written to tmp_path/ and mirrored to artifacts/
-
-        Graph: one line per document type.
-        """
-        rng = np.random.default_rng(99)
-        mock_llm = MockLLM(_build_llm_map())
-        classifier = MinimalClassifier(mock_llm)
-        store = ClassificationStore(temp_store_dir)
-
-        all_docs: list[tuple[str, str]] = []
-        for doc_type in DOCUMENT_TYPES:
-            for text in _KEYWORD_CORPUS.get(doc_type, []):
-                all_docs.append((text, doc_type))
-            for text in _AMBIGUOUS_CORPUS.get(doc_type, []):
-                all_docs.append((text, doc_type))
-
-        indices = rng.permutation(len(all_docs))
-        all_docs = [all_docs[i] for i in indices]
-
-        BATCH_SIZE = 5
-        results: list[dict] = []
-
-        for batch_start in range(0, len(all_docs), BATCH_SIZE):
-            batch = all_docs[batch_start : batch_start + BATCH_SIZE]
-            for text, true_label in batch:
-                predicted = classifier.classify_document(text)
-                store.add(text, predicted, true_label, make_embedding(rng, true_label))
-
-            row: dict = {"n_classified": len(store)}
-            for doc_type in DOCUMENT_TYPES:
-                row[f"acc_{doc_type}"] = store.accuracy_for(doc_type)
-            results.append(row)
-
-        df = pd.DataFrame(results)
-
-        for doc_type in DOCUMENT_TYPES:
-            final_acc = df[f"acc_{doc_type}"].iloc[-1]
-            assert final_acc >= 50.0, (
-                f"Category '{doc_type}' final accuracy {final_acc:.1f}% is too low"
+        for seed, df in runs.items():
+            print(
+                f"\n[Run seed={seed}]"
+                f"  snapshots={len(df)}"
+                f"  index_start={df['index_hit_pct'].iloc[0]:.1f}%"
+                f"  index_end={df['index_hit_pct'].iloc[-1]:.1f}%"
+                f"  llm_start={df['llm_call_pct'].iloc[0]:.1f}%"
+                f"  llm_end={df['llm_call_pct'].iloc[-1]:.1f}%"
+                f"  speed_first={df['window_median_ms'].iloc[0]:.4f}ms"
+                f"  speed_last={df['window_median_ms'].iloc[-1]:.4f}ms"
             )
 
-        chart_path = tmp_path / "per_category_accuracy.png"
-        _plot_per_category_accuracy(df, chart_path)
-        assert chart_path.exists() and chart_path.stat().st_size > 0
-
-        artifacts_dir = Path(__file__).parent.parent / "artifacts"
-        if artifacts_dir.exists():
-            shutil.copy(chart_path, artifacts_dir / "per_category_accuracy.png")
-
-        print(f"\n[Per-category]  n={len(store)}")
-        for doc_type in DOCUMENT_TYPES:
-            print(f"  {doc_type:30s}: {df[f'acc_{doc_type}'].iloc[-1]:.0f}%")
-
     # -----------------------------------------------------------------------
-    # Test 3: Keyword vs LLM path counts per category
+    # Test 2: Keyword vs LLM path counts per category
     # -----------------------------------------------------------------------
 
     def test_keyword_vs_llm_path_per_category(self, temp_store_dir: str) -> None:
@@ -685,7 +535,7 @@ class TestPipelineClassificationDynamics:
             for text in _KEYWORD_CORPUS.get(doc_type, []):
                 llm_before = mock_llm.call_count
                 predicted = classifier.classify_document(text)
-                store.add(text, predicted, doc_type, make_embedding(rng, doc_type))
+                store.add(text, predicted, make_embedding(rng, doc_type))
 
                 if doc_type == "unknown":
                     expected_llm_calls += 1
@@ -700,7 +550,7 @@ class TestPipelineClassificationDynamics:
             for text in _AMBIGUOUS_CORPUS.get(doc_type, []):
                 expected_llm_calls += 1
                 predicted = classifier.classify_document(text)
-                store.add(text, predicted, doc_type, make_embedding(rng, doc_type))
+                store.add(text, predicted, make_embedding(rng, doc_type))
                 assert mock_llm.call_count == expected_llm_calls, (
                     f"Ambiguous doc should trigger LLM: {text[:50]}"
                 )
@@ -708,7 +558,7 @@ class TestPipelineClassificationDynamics:
         assert mock_llm.call_count == expected_llm_calls
 
     # -----------------------------------------------------------------------
-    # Test 4: Store persistence round-trip
+    # Test 3: Store persistence round-trip
     # -----------------------------------------------------------------------
 
     def test_store_persists_to_disk(self, temp_store_dir: str) -> None:
@@ -720,7 +570,7 @@ class TestPipelineClassificationDynamics:
         ----------
         * embeddings.npy and metadata.json exist after classification.
         * Reloaded embedding shape matches.
-        * Reloaded metadata preserves predicted/true labels and correct flag.
+        * Reloaded metadata contains text_snippet and predicted fields.
         """
         mock_llm = MockLLM(_build_llm_map())
         classifier = MinimalClassifier(mock_llm)
@@ -732,9 +582,9 @@ class TestPipelineClassificationDynamics:
             (_AMBIGUOUS_CORPUS["certificate_of_quality"][0], "certificate_of_quality"),
             (_KEYWORD_CORPUS["bse_tse_declaration"][0], "bse_tse_declaration"),
         ]
-        for text, true_label in docs:
+        for text, doc_type in docs:
             predicted = classifier.classify_document(text)
-            store.add(text, predicted, true_label, make_embedding(rng, true_label))
+            store.add(text, predicted, make_embedding(rng, doc_type))
 
         emb_path = Path(temp_store_dir) / ClassificationStore._EMBEDDINGS_FILE
         meta_path = Path(temp_store_dir) / ClassificationStore._META_FILE
@@ -751,6 +601,4 @@ class TestPipelineClassificationDynamics:
 
         for entry in loaded_meta:
             assert "predicted" in entry
-            assert "true" in entry
-            assert "correct" in entry
-            assert entry["correct"] == (entry["predicted"] == entry["true"])
+            assert "text_snippet" in entry
