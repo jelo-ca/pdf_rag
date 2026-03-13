@@ -7,6 +7,7 @@ multi-document test suite (PDF and image/OCR) without hitting the real pipeline.
 FakeRAG mirrors the RAGPipeline public interface:
   - build(pdf_path, classify_docs=False)
   - build_from_multiple_pdfs(pdf_paths, classify_docs=False)
+    - build_from_multiple_image_folders(folder_paths, classify_docs=False)
   - build_from_images(folder_path, classify_docs=False)
   - query_with_sources(question, ...)
 """
@@ -35,9 +36,9 @@ class FakeRAG:
     """Deterministic stub that mirrors the RAGPipeline public interface.
 
     ``responses`` maps query text → the dict returned by query_with_sources.
-    ``build``, ``build_from_multiple_pdfs``, and ``build_from_images`` are
-    no-ops so that tests can exercise the full harness flow without a real
-    model or index.
+    ``build``, ``build_from_multiple_pdfs``, ``build_from_multiple_image_folders``,
+    and ``build_from_images`` are no-ops so that tests can exercise the full
+    harness flow without a real model or index.
     """
 
     responses: Dict[str, Dict[str, Any]]
@@ -53,6 +54,14 @@ class FakeRAG:
     def build_from_multiple_pdfs(
         self,
         pdf_paths: List[str],
+        classify_docs: bool = False,
+        progress_callback: Any = None,
+    ) -> None:  # noqa: ARG002
+        self._built = True
+
+    def build_from_multiple_image_folders(
+        self,
+        folder_paths: List[str],
         classify_docs: bool = False,
         progress_callback: Any = None,
     ) -> None:  # noqa: ARG002

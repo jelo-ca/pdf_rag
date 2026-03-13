@@ -29,6 +29,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "integration: true pipeline accuracy test requiring a real model and indexed documents",
     )
+    config.addinivalue_line(
+        "markers",
+        "ocr_scan: OCR accuracy and classification correctness tests on image_test folders",
+    )
 
 # ---------------------------------------------------------------------------
 # Check whether the heavy stack is available; if not, inject stubs.

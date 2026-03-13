@@ -1,0 +1,6 @@
+folder,word_density,avg_word_length,unique_words,words_per_page,kw_preservation,page_coverage,total_pages,cat_cover_letter,cat_certificate_of_quality,cat_packaging_specification,cat_bse_tse_declaration,cat_material_description,cat_supplier_qualification,cat_chain_of_custody,cat_unknown
+image_test_1,0.726852430338623,5.446629213483146,321,62.8235294117647,0.9,1.0,17,0,0,0,0,0,0,0,17
+image_test_2,0.7333858090633082,5.569598633646456,338,65.05555555555556,0.9,1.0,18,0,0,0,0,0,0,0,18
+image_test_3,0.7320322542947295,5.5482728077945085,314,62.72222222222222,0.9,1.0,18,0,0,0,0,0,0,0,18
+image_test_4,0.7321367715551517,5.5608283002588434,332,64.38888888888889,0.9,1.0,18,0,0,0,0,0,0,0,18
+image_test_5,0.7251167362988449,5.458834412580943,325,63.588235294117645,0.9,1.0,17,0,0,0,0,0,0,0,17

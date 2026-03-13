@@ -9,7 +9,9 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -53,9 +55,9 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help=(
-            "Directory for a persistent vector index. "
-            "On the first run the index is built and saved here; "
-            "subsequent runs load it directly, skipping PDF ingestion and LLM classification."
+            "Optional parent directory for temporary regression indexes. "
+            "PDF and OCR phases rebuild a growing shared corpus in temporary "
+            "persisted indexes to simulate how the app accumulates data over time."
         ),
     )
     return parser.parse_args()
@@ -1092,6 +1094,25 @@ def build_combined_suite() -> list[dict]:
     )
 
 
+def build_pdf_suite_map() -> dict[str, list[dict]]:
+    """Return per-file PDF regression suites keyed by filename."""
+    return {
+        "test_1.pdf": suite_test1(),
+        "test_2.pdf": suite_test2(),
+        "test_3.pdf": suite_test3(),
+        "test_4.pdf": suite_test4(),
+        "test_5.pdf": suite_test5(),
+        "test_7.pdf": suite_test7(),
+        "test_8.pdf": suite_test8(),
+        "test_9.pdf": suite_test9(),
+        "test_10.pdf": suite_test10(),
+        "test_11.pdf": suite_test11(),
+        "test_12.pdf": suite_test12(),
+        "test_13.pdf": suite_test13(),
+        "test_14.pdf": suite_test14(),
+    }
+
+
 def build_image_suite() -> list[dict]:
     """Combine all image (OCR) per-folder suites into a single regression suite."""
     return (
@@ -1101,6 +1122,29 @@ def build_image_suite() -> list[dict]:
         + suite_image_test4()
         + suite_image_test5()
     )
+
+
+def build_image_suite_map() -> dict[str, list[dict]]:
+    """Return per-folder OCR regression suites keyed by folder name."""
+    return {
+        "image_test_1": suite_image_test1(),
+        "image_test_2": suite_image_test2(),
+        "image_test_3": suite_image_test3(),
+        "image_test_4": suite_image_test4(),
+        "image_test_5": suite_image_test5(),
+    }
+
+
+def _force_full_pipeline_flags(test_cases: list[dict]) -> list[dict]:
+    """Ensure every regression case runs classify + query expansion paths."""
+    enriched: list[dict] = []
+    for case in test_cases:
+        row = dict(case)
+        row["classify"] = True
+        row["expand"] = True
+        row["num_expansions"] = max(int(row.get("num_expansions", 3)), 3)
+        enriched.append(row)
+    return enriched
 
 
 def main() -> int:
@@ -1115,12 +1159,7 @@ def main() -> int:
         pipeline_kwargs["model_path"] = args.model_path
 
     index_dir = args.index_dir or ""
-    if index_dir:
-        pipeline_kwargs["persist_dir"] = index_dir
-        index_path = Path(index_dir)
-        index_exists = index_path.exists() and any(index_path.iterdir())
-    else:
-        index_exists = False
+    index_root = Path(index_dir) if index_dir else None
 
     # ------------------------------------------------------------------
     # Phase 1: PDF regression suite
@@ -1130,23 +1169,53 @@ def main() -> int:
         print(f"ERROR: No PDF files found in {docs_dir.resolve()}", file=sys.stderr)
         return 1
 
-    if index_exists:
-        print(f"Loading cached index from {index_dir} (skipping PDF ingestion and LLM classification).")
-    else:
-        print(f"Indexing {len(pdf_files)} PDF(s):")
-        for p in pdf_files:
-            print(f"  {p}")
+    print(f"Running cumulative PDF regression across {len(pdf_files)} file(s):")
+    pdf_suite_map = build_pdf_suite_map()
+    per_pdf_results = []
 
-    rag = RAGPipeline(**pipeline_kwargs)
-    rag.build_from_multiple_pdfs(
-        [str(p) for p in pdf_files],
-        classify_docs=True,
-        force_rebuild=not index_exists,
-    )
+    shared_pdf_files = []
+    for pdf_file in pdf_files:
+        if pdf_file.name not in pdf_suite_map:
+            print(f"  SKIP {pdf_file.name}: no suite mapping found")
+            continue
+        shared_pdf_files.append(pdf_file)
 
-    harness = RAGRegressionHarness(rag)
-    suite_df = harness.create_test_suite(build_combined_suite())
-    results_df = harness.run(suite_df)
+    if not shared_pdf_files:
+        print("ERROR: No PDF regression suites were executed.", file=sys.stderr)
+        return 1
+
+    with tempfile.TemporaryDirectory(dir=str(index_root) if index_root else None) as temp_index_root:
+        pdf_index_dir = Path(temp_index_root) / "pdf_cumulative"
+        seen_pdf_files: list[Path] = []
+
+        for pdf_file in shared_pdf_files:
+            seen_pdf_files.append(pdf_file)
+            print(f"  {pdf_file.name} (corpus size: {len(seen_pdf_files)})")
+
+            pdf_pipeline_kwargs = dict(pipeline_kwargs)
+            pdf_pipeline_kwargs["persist_dir"] = str(pdf_index_dir)
+
+            rag = RAGPipeline(**pdf_pipeline_kwargs)
+            rag.build_from_multiple_pdfs(
+                [str(seen_pdf_file) for seen_pdf_file in seen_pdf_files],
+                classify_docs=True,
+            )
+
+            harness = RAGRegressionHarness(rag)
+            suite_cases = pdf_suite_map[pdf_file.name]
+            full_flow_suite = _force_full_pipeline_flags(suite_cases)
+            suite_df = harness.create_test_suite(full_flow_suite)
+            file_results = harness.run(suite_df)
+            file_results["source_file"] = pdf_file.name
+            file_results["indexed_corpus_size"] = len(seen_pdf_files)
+            per_pdf_results.append(file_results)
+
+    if not per_pdf_results:
+        print("ERROR: No PDF regression suites were executed.", file=sys.stderr)
+        return 1
+
+    import pandas as pd
+    results_df = pd.concat(per_pdf_results, ignore_index=True)
 
     results_csv = artifacts_dir / "regression_results.csv"
     dashboard_png = artifacts_dir / "regression_dashboard.png"
@@ -1179,29 +1248,49 @@ def main() -> int:
     # ------------------------------------------------------------------
     image_folders = sorted([d for d in docs_dir.iterdir() if d.is_dir() and d.name.startswith("image_test_")])
     if image_folders:
-        print(f"\nRunning OCR regression for {len(image_folders)} image folder(s):")
+        print(f"\nRunning cumulative OCR regression for {len(image_folders)} image folder(s):")
         image_results_list = []
 
+        image_suite_map = build_image_suite_map()
+        shared_image_folders = []
+
         for folder in image_folders:
+            if folder.name not in image_suite_map:
+                print(f"  SKIP {folder.name}: no suite mapping found", file=sys.stderr)
+                continue
             print(f"  {folder.name}")
-            img_rag = RAGPipeline(**pipeline_kwargs)
-            try:
-                img_rag.build_from_images(str(folder), classify_docs=False)
-            except RuntimeError as exc:
-                print(f"  SKIP {folder.name}: {exc}", file=sys.stderr)
-                continue
+            shared_image_folders.append(folder)
 
-            folder_idx = folder.name.split("_")[-1]
-            suite_func_name = f"suite_image_test{folder_idx}"
-            suite_func = globals().get(suite_func_name)
-            if suite_func is None:
-                print(f"  SKIP {folder.name}: no suite function '{suite_func_name}'", file=sys.stderr)
-                continue
+        if shared_image_folders:
+            with tempfile.TemporaryDirectory(dir=str(index_root) if index_root else None) as temp_index_root:
+                image_index_dir = Path(temp_index_root) / "image_cumulative"
+                seen_image_folders: list[Path] = []
 
-            img_suite_df = harness.create_test_suite(suite_func())
-            img_harness = RAGRegressionHarness(img_rag)
-            img_results = img_harness.run(img_suite_df)
-            image_results_list.append(img_results)
+                for folder in shared_image_folders:
+                    seen_image_folders.append(folder)
+                    print(f"  {folder.name} (corpus size: {len(seen_image_folders)})")
+
+                    image_pipeline_kwargs = dict(pipeline_kwargs)
+                    image_pipeline_kwargs["persist_dir"] = str(image_index_dir)
+
+                    img_rag = RAGPipeline(**image_pipeline_kwargs)
+                    try:
+                        img_rag.build_from_multiple_image_folders(
+                            [str(seen_folder) for seen_folder in seen_image_folders],
+                            classify_docs=True,
+                        )
+                    except RuntimeError as exc:
+                        print(f"  SKIP OCR phase: {exc}", file=sys.stderr)
+                        image_results_list = []
+                        break
+
+                    img_harness = RAGRegressionHarness(img_rag)
+                    img_full_flow_suite = _force_full_pipeline_flags(image_suite_map[folder.name])
+                    img_suite_df = img_harness.create_test_suite(img_full_flow_suite)
+                    img_results = img_harness.run(img_suite_df)
+                    img_results["source_file"] = folder.name
+                    img_results["indexed_corpus_size"] = len(seen_image_folders)
+                    image_results_list.append(img_results)
 
         if image_results_list:
             import pandas as pd

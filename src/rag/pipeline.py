@@ -978,6 +978,101 @@ class RAGPipeline:
         self.clear_cache()
         logger.info("RAG pipeline ready with %d documents.", len(pdf_paths))
 
+    def build_from_multiple_image_folders(
+        self,
+        folder_paths: List[str],
+        classify_docs: bool = False,
+        progress_callback: Optional[callable] = None,
+        force_rebuild: bool = True,
+    ) -> None:
+        """Index multiple image folders into one shared OCR corpus.
+
+        This method OCR-processes each folder sequentially, combines all pages,
+        and builds a single searchable index across the full image corpus.
+
+        Args:
+            folder_paths: List of folders containing image files.
+            classify_docs: When ``True``, each page is classified by the LLM and
+                its ``pharma_doc_type`` is stored in chunk metadata.
+            progress_callback: Optional callback function called after each
+                folder is loaded. Receives (current_index, total_count,
+                folder_name).
+            force_rebuild: When ``False`` and a persisted index already exists at
+                ``persist_dir``, the stored index is loaded directly, skipping
+                OCR and classification. Defaults to ``True``.
+
+        Raises:
+            ValueError: If folder_paths is empty or no text is extracted.
+        """
+        if not folder_paths:
+            raise ValueError("No image folder paths provided.")
+
+        if not force_rebuild and self.persist_dir and os.path.exists(self.persist_dir):
+            try:
+                logger.info("Loading persisted OCR index from %s ...", self.persist_dir)
+                storage_context = StorageContext.from_defaults(persist_dir=self.persist_dir)
+                self._vector_index = load_index_from_storage(storage_context)
+                self._chunks = list(self._vector_index.docstore.docs.values())
+                self._docs_classified = classify_docs
+                self._pdf_path = f"Multiple image folders ({len(folder_paths)} folders)"
+                hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
+                self._query_engine = RetrieverQueryEngine.from_args(
+                    retriever=hybrid_retriever,
+                    llm=self.llm,
+                    text_qa_template=_PHARMA_QA_PROMPT,
+                )
+                self.clear_cache()
+                logger.info(
+                    "OCR pipeline ready from cache: %d chunks, %d folders.",
+                    len(self._chunks),
+                    len(folder_paths),
+                )
+                return
+            except (FileNotFoundError, OSError, ValueError, RuntimeError) as exc:
+                logger.warning("Could not load persisted OCR index (%s); rebuilding.", exc)
+
+        if self.persist_dir and os.path.exists(self.persist_dir):
+            logger.info("Clearing persisted OCR index for multi-folder build...")
+            shutil.rmtree(self.persist_dir)
+
+        all_documents: List[Document] = []
+
+        for idx, folder_path in enumerate(folder_paths, 1):
+            logger.info("Loading image folder %d/%d: %s", idx, len(folder_paths), folder_path)
+            documents = self.load_images(folder_path)
+            all_documents.extend(documents)
+
+            if progress_callback:
+                progress_callback(idx, len(folder_paths), os.path.basename(folder_path))
+
+        if not all_documents:
+            raise ValueError("No text extracted from the provided image folders.")
+
+        logger.info("Loaded %d total OCR pages from %d folders.", len(all_documents), len(folder_paths))
+
+        if classify_docs:
+            all_documents = self._annotate_pharma_doc_types(all_documents)
+            before = len(all_documents)
+            all_documents = [d for d in all_documents if d.metadata.get("pharma_doc_type") != "unknown"]
+            dropped = before - len(all_documents)
+            if dropped:
+                logger.info("Skipping %d OCR page(s) classified as 'unknown'.", dropped)
+        self._docs_classified = classify_docs
+
+        self._chunks = self._chunk(all_documents)
+        self._vector_index = self._index(self._chunks)
+
+        hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
+        self._query_engine = RetrieverQueryEngine.from_args(
+            retriever=hybrid_retriever,
+            llm=self.llm,
+            text_qa_template=_PHARMA_QA_PROMPT,
+        )
+
+        self._pdf_path = f"Multiple image folders ({len(folder_paths)} folders)"
+        self.clear_cache()
+        logger.info("RAG OCR pipeline ready with %d folders.", len(folder_paths))
+
     # ------------------------------------------------------------------
     # Image (OCR) Ingestion
     # ------------------------------------------------------------------
