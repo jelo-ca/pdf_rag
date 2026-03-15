@@ -1,16 +1,19 @@
 """
-CI-friendly module stubs
-========================
+CI-friendly module stubs + pytest marker registration
+======================================================
 When heavy ML dependencies (llama-index, torch, llama-cpp-python, …) are not
 installed – as is the case in lightweight CI environments – this conftest
 pre-populates sys.modules with MagicMock stubs so that ``rag.pipeline``
 can be imported without those packages present.
 
-The test fixtures in ``test_rag_pipeline.py`` patch the same symbols at the
-``rag.pipeline`` namespace level (e.g. ``patch("rag.pipeline.LlamaCPP")``),
-which is fully compatible with the stubs set here.
-
-When the packages *are* installed (local dev), the real modules are used.
+Markers
+-------
+unit        : pure-Python tests; no model files, OCR, or external packages needed.
+integration : tests that require the real llama-index/sentence-transformers stack
+              (no GPU required, but packages must be installed).
+ocr_scan    : tests that require a Tesseract binary to be present on PATH.
+benchmark   : timing and retrieval-quality tests that write CSV/PNG artifacts
+              to the ``artifacts/`` directory.
 """
 
 import sys
@@ -20,23 +23,11 @@ import pytest
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register custom markers so pytest does not emit PytestUnknownMarkWarning."""
-    config.addinivalue_line(
-        "markers",
-        "unit: harness-unit test using a deterministic fake pipeline (no real model required)",
-    )
-    config.addinivalue_line(
-        "markers",
-        "integration: true pipeline accuracy test requiring a real model and indexed documents",
-    )
-    config.addinivalue_line(
-        "markers",
-        "ocr_scan: OCR accuracy and classification correctness tests on image_test folders",
-    )
+    config.addinivalue_line("markers", "unit: no external dependencies required")
+    config.addinivalue_line("markers", "integration: requires llama-index stack (no GPU)")
+    config.addinivalue_line("markers", "ocr_scan: requires Tesseract binary on PATH")
+    config.addinivalue_line("markers", "benchmark: timing/quality tests; writes artifacts/")
 
-# ---------------------------------------------------------------------------
-# Check whether the heavy stack is available; if not, inject stubs.
-# ---------------------------------------------------------------------------
 
 def _available(module: str) -> bool:
     try:
@@ -47,7 +38,6 @@ def _available(module: str) -> bool:
 
 
 if not _available("llama_index"):
-    # Minimal Document stub: stores text + metadata so tests can inspect them.
     class _Document:
         def __init__(self, text: str = "", metadata: dict = None, **kwargs):
             self.text = text
@@ -75,5 +65,4 @@ if not _available("llama_index"):
     for _mod in _STUBS:
         sys.modules.setdefault(_mod, MagicMock())
 
-    # Inject the proper Document stub so metadata is preserved after construction.
     sys.modules["llama_index.core"].Document = _Document

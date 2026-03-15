@@ -1,0 +1,13 @@
+Component,Setting,Value,Notes
+Embedding Model,Model Name,all-MiniLM-L6-v2,Sentence-Transformers; 384-dim
+Chunking,Chunk Size,512 tokens,SentenceSplitter
+Chunking,Overlap,50 tokens,~10 % overlap
+Retrieval,Top-K,5 chunks,Per retriever before fusion
+Retrieval,Mode,Reciprocal Rank Fusion,BM25 + Vector → RRF
+LLM,Max Tokens,200,Output length cap
+LLM,Context Window,8192 tokens,Input context
+LLM,Temperature,0.1,Near-deterministic
+OCR,DPI,200,Tesseract rasterisation
+OCR,Scanned Threshold,100 chars,Below → OCR fallback
+Classification,Categories,8,Including 'unknown'
+Classification,Keyword Categories,7,Fast-path; no LLM call

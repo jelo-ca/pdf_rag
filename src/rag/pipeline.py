@@ -18,13 +18,14 @@ LLM             : Mistral GGUF (local, via llama-cpp-python)
 import logging
 import os
 import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterator, List, Optional
 
 import fitz  # PyMuPDF
 import torch
 from dotenv import load_dotenv
-from llama_index.core import Document, Settings, StorageContext, VectorStoreIndex, load_index_from_storage
+from llama_index.core import Document, QueryBundle, Settings, StorageContext, VectorStoreIndex, load_index_from_storage
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.query_engine import RetrieverQueryEngine
@@ -325,6 +326,10 @@ class RAGPipeline:
         self._chunks: List[Any] = []
         self._vector_index: Optional[VectorStoreIndex] = None
         self._query_engine: Optional[RetrieverQueryEngine] = None
+        self._bm25_engine: Optional[RetrieverQueryEngine] = None
+        self._vector_engine: Optional[RetrieverQueryEngine] = None
+        self._hybrid_engine: Optional[RetrieverQueryEngine] = None
+        self._filtered_engine_cache: Dict[tuple, RetrieverQueryEngine] = {}
         self._pdf_path: Optional[str] = None
         self._docs_classified: bool = False
         self._query_cache: Dict[tuple, Dict[str, Any]] = {}
@@ -738,8 +743,33 @@ class RAGPipeline:
         logger.info("Document classification complete.")
         return documents
 
-    def _build_filtered_engine(self, pharma_doc_type: str) -> RetrieverQueryEngine:
-        """Build a query engine whose retrieval is scoped to a single pharma doc type.
+    def _finalize_engines(self) -> None:
+        """Precompute BM25-only and Vector-only engines alongside the hybrid engine.
+
+        Called at the end of every ``build*`` method once ``_vector_index``,
+        ``_chunks``, and ``_query_engine`` (hybrid) are all set.  Also clears
+        the filtered-engine cache so stale per-category engines are evicted.
+        """
+        bm25_r = BM25Retriever.from_defaults(
+            nodes=self._chunks, similarity_top_k=self.similarity_top_k
+        )
+        vec_r = VectorIndexRetriever(
+            index=self._vector_index, similarity_top_k=self.similarity_top_k
+        )
+        self._bm25_engine = RetrieverQueryEngine.from_args(
+            retriever=bm25_r, llm=self.llm, text_qa_template=_PHARMA_QA_PROMPT
+        )
+        self._vector_engine = RetrieverQueryEngine.from_args(
+            retriever=vec_r, llm=self.llm, text_qa_template=_PHARMA_QA_PROMPT
+        )
+        self._hybrid_engine = self._query_engine
+        self._filtered_engine_cache.clear()
+        logger.debug("BM25-only and Vector-only engines precomputed.")
+
+    def _build_filtered_engine(
+        self, pharma_doc_type: str, retrieval_mode: str = "hybrid"
+    ) -> RetrieverQueryEngine:
+        """Build (or return cached) a query engine scoped to a single pharma doc type.
 
         Both the vector retriever (via :class:`MetadataFilters`) and the BM25
         retriever (via pre-filtered node list) are restricted to chunks whose
@@ -747,6 +777,8 @@ class RAGPipeline:
 
         Args:
             pharma_doc_type: A category string from :data:`_PHARMA_DOC_CATEGORIES`.
+            retrieval_mode: ``"bm25"``, ``"vector"``, or ``"hybrid"`` (default).
+                Determines which retriever(s) are used within the filtered engine.
 
         Returns:
             A :class:`~llama_index.core.query_engine.RetrieverQueryEngine` scoped
@@ -758,6 +790,10 @@ class RAGPipeline:
         if self._vector_index is None:
             raise RuntimeError("Pipeline not built. Call build(pdf_path) first.")
 
+        cache_key = (pharma_doc_type, retrieval_mode)
+        if cache_key in self._filtered_engine_cache:
+            return self._filtered_engine_cache[cache_key]
+
         filters = MetadataFilters(filters=[MetadataFilter(key="pharma_doc_type", value=pharma_doc_type)])
         vector_retriever = VectorIndexRetriever(
             index=self._vector_index,
@@ -766,28 +802,42 @@ class RAGPipeline:
         )
 
         filtered_chunks = [c for c in self._chunks if c.metadata.get("pharma_doc_type") == pharma_doc_type]
-        if filtered_chunks:
-            bm25_retriever = BM25Retriever.from_defaults(
+        bm25_retriever = (
+            BM25Retriever.from_defaults(
                 nodes=filtered_chunks,
                 similarity_top_k=min(self.similarity_top_k, len(filtered_chunks)),
             )
-            retrievers: List[Any] = [vector_retriever, bm25_retriever]
-        else:
-            retrievers = [vector_retriever]
+            if filtered_chunks
+            else None
+        )
 
-        hybrid_retriever = QueryFusionRetriever(
-            retrievers=retrievers,
-            similarity_top_k=self.similarity_top_k,
-            num_queries=self.num_queries,
-            mode="reciprocal_rerank",
-            use_async=False,
-            llm=self.llm,
-        )
-        return RetrieverQueryEngine.from_args(
-            retriever=hybrid_retriever,
-            llm=self.llm,
-            text_qa_template=_PHARMA_QA_PROMPT,
-        )
+        if retrieval_mode == "bm25":
+            retriever: Any = bm25_retriever or vector_retriever
+            engine = RetrieverQueryEngine.from_args(
+                retriever=retriever, llm=self.llm, text_qa_template=_PHARMA_QA_PROMPT
+            )
+        elif retrieval_mode == "vector":
+            engine = RetrieverQueryEngine.from_args(
+                retriever=vector_retriever, llm=self.llm, text_qa_template=_PHARMA_QA_PROMPT
+            )
+        else:  # hybrid (default)
+            retrievers: List[Any] = [vector_retriever] + ([bm25_retriever] if bm25_retriever else [])
+            hybrid_retriever = QueryFusionRetriever(
+                retrievers=retrievers,
+                similarity_top_k=self.similarity_top_k,
+                num_queries=self.num_queries,
+                mode="reciprocal_rerank",
+                use_async=False,
+                llm=self.llm,
+            )
+            engine = RetrieverQueryEngine.from_args(
+                retriever=hybrid_retriever,
+                llm=self.llm,
+                text_qa_template=_PHARMA_QA_PROMPT,
+            )
+
+        self._filtered_engine_cache[cache_key] = engine
+        return engine
 
     # ------------------------------------------------------------------
     # Public API
@@ -876,6 +926,7 @@ class RAGPipeline:
             llm=self.llm,
             text_qa_template=_PHARMA_QA_PROMPT,
         )
+        self._finalize_engines()
         self.clear_cache()
         logger.info("RAG pipeline ready.")
 
@@ -924,6 +975,7 @@ class RAGPipeline:
                     llm=self.llm,
                     text_qa_template=_PHARMA_QA_PROMPT,
                 )
+                self._finalize_engines()
                 self.clear_cache()
                 logger.info(
                     "Pipeline ready from cache: %d chunks, %d PDFs.",
@@ -975,6 +1027,7 @@ class RAGPipeline:
 
         # Store list of PDF paths for stats
         self._pdf_path = f"Multiple files ({len(pdf_paths)} PDFs)"
+        self._finalize_engines()
         self.clear_cache()
         logger.info("RAG pipeline ready with %d documents.", len(pdf_paths))
 
@@ -1021,6 +1074,7 @@ class RAGPipeline:
                     llm=self.llm,
                     text_qa_template=_PHARMA_QA_PROMPT,
                 )
+                self._finalize_engines()
                 self.clear_cache()
                 logger.info(
                     "OCR pipeline ready from cache: %d chunks, %d folders.",
@@ -1070,6 +1124,7 @@ class RAGPipeline:
         )
 
         self._pdf_path = f"Multiple image folders ({len(folder_paths)} folders)"
+        self._finalize_engines()
         self.clear_cache()
         logger.info("RAG OCR pipeline ready with %d folders.", len(folder_paths))
 
@@ -1188,6 +1243,7 @@ class RAGPipeline:
             llm=self.llm,
             text_qa_template=_PHARMA_QA_PROMPT,
         )
+        self._finalize_engines()
         self.clear_cache()
         logger.info("RAG pipeline ready from image folder: %s", folder_path)
 
@@ -1397,8 +1453,9 @@ class RAGPipeline:
         expand: bool = False,
         num_expansions: int = 3,
         classify: bool = False,
+        retrieval_mode: str = "hybrid",
     ) -> Dict[str, Any]:
-        """Query the pipeline and return a structured result with sources and confidence.
+        """Query the pipeline and return a structured result with sources, confidence, and stage timings.
 
         Confidence scores are derived from the RRF retrieval scores normalised
         to a 0–100 % scale relative to the top-ranked chunk. When all raw scores
@@ -1415,6 +1472,8 @@ class RAGPipeline:
                 the index to have been built with ``classify_docs=True``; if
                 not, classification still runs but no filtering is applied.
                 The detected category is returned under ``query_category``.
+            retrieval_mode: ``"bm25"``, ``"vector"``, or ``"hybrid"`` (default).
+                Selects the pre-built engine created by :meth:`build`.
 
         Returns:
             A dictionary with the following keys:
@@ -1433,6 +1492,13 @@ class RAGPipeline:
             - ``chunk_count`` (*int*) – Number of chunks retrieved.
             - ``query_category`` (*str | None*) – Pharma category the query was
               classified into, or ``None`` if ``classify=False``.
+            - ``retrieval_mode`` (*str*) – Echoes the ``retrieval_mode`` used.
+            - ``expand_ms`` (*float*) – Wall-clock ms spent in query expansion.
+            - ``classify_ms`` (*float*) – Wall-clock ms spent in query classification
+              and filtered-engine selection.
+            - ``retrieve_ms`` (*float*) – Wall-clock ms spent in chunk retrieval.
+            - ``generate_ms`` (*float*) – Wall-clock ms spent in answer generation.
+            - ``total_ms`` (*float*) – End-to-end wall-clock ms (all stages).
 
         Raises:
             RuntimeError: If :meth:`build` has not been called yet.
@@ -1440,30 +1506,54 @@ class RAGPipeline:
         if self._query_engine is None:
             raise RuntimeError("Pipeline not built. Call build(pdf_path) first.")
 
-        cache_key = (question, expand, num_expansions, classify, self.similarity_top_k)
+        cache_key = (question, expand, num_expansions, classify, retrieval_mode, self.similarity_top_k)
         if cache_key in self._query_cache:
             logger.debug("Cache hit for query: %s", question)
             return self._query_cache[cache_key]
 
+        t_start = time.perf_counter()
+
+        # Stage 1: query expansion
+        t0 = time.perf_counter()
         search_query = question
         if expand:
             queries = self.expand_query(question, num_expansions=num_expansions)
             search_query = queries[1] if len(queries) > 1 else question
+        expand_ms = (time.perf_counter() - t0) * 1_000
 
+        # Stage 2: query classification + filtered-engine selection
+        t0 = time.perf_counter()
+        _engine_map = {
+            "bm25":   self._bm25_engine,
+            "vector": self._vector_engine,
+            "hybrid": self._hybrid_engine,
+        }
+        engine = _engine_map.get(retrieval_mode) or self._query_engine
         query_category: Optional[str] = None
-        engine = self._query_engine
         if classify:
             query_category = self._classify_query(search_query)
             if self._docs_classified and query_category != "unknown":
-                engine = self._build_filtered_engine(query_category)
+                engine = self._build_filtered_engine(query_category, retrieval_mode=retrieval_mode)
+        classify_ms = (time.perf_counter() - t0) * 1_000
 
-        response = engine.query(search_query)
+        # Stage 3: retrieval (timed separately via public API)
+        query_bundle = QueryBundle(query_str=search_query)
+        t0 = time.perf_counter()
+        source_nodes = engine.retrieve(query_bundle)
+        retrieve_ms = (time.perf_counter() - t0) * 1_000
 
-        raw_scores = [n.score for n in response.source_nodes if n.score is not None]
+        # Stage 4: answer generation
+        t0 = time.perf_counter()
+        response = engine.synthesize(query_bundle, source_nodes)
+        generate_ms = (time.perf_counter() - t0) * 1_000
+
+        total_ms = (time.perf_counter() - t_start) * 1_000
+
+        raw_scores = [n.score for n in source_nodes if n.score is not None]
         max_score = max(raw_scores) if raw_scores else 0.0
 
         sources: List[Dict[str, Any]] = []
-        for rank, node in enumerate(response.source_nodes):
+        for rank, node in enumerate(source_nodes):
             meta = node.node.metadata
             if max_score > 0 and node.score is not None:
                 confidence = round((node.score / max_score) * 100, 1)
@@ -1485,6 +1575,12 @@ class RAGPipeline:
             "sources": sources,
             "chunk_count": len(sources),
             "query_category": query_category,
+            "retrieval_mode": retrieval_mode,
+            "expand_ms":   round(expand_ms,   3),
+            "classify_ms": round(classify_ms, 3),
+            "retrieve_ms": round(retrieve_ms, 3),
+            "generate_ms": round(generate_ms, 3),
+            "total_ms":    round(total_ms,    3),
         }
         self._query_cache[cache_key] = result
         return result

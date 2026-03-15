@@ -60,6 +60,28 @@ def parse_args() -> argparse.Namespace:
             "persisted indexes to simulate how the app accumulates data over time."
         ),
     )
+    parser.add_argument(
+        "--latency-profile",
+        choices=["retrieval_only", "retrieval_plus_classify", "retrieval_plus_expand", "full"],
+        default="full",
+        help=(
+            "Pipeline stages to exercise per test. "
+            "'retrieval_only' = no classify, no expand, no generation timing difference; "
+            "'retrieval_plus_classify' = classify=True, expand=False; "
+            "'retrieval_plus_expand' = classify=False, expand=True; "
+            "'full' = classify=True, expand=True (original behaviour)."
+        ),
+    )
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=["bm25", "vector", "hybrid", "all"],
+        default="hybrid",
+        help=(
+            "Retriever to use. "
+            "'bm25' = BM25-only; 'vector' = vector-only; 'hybrid' = RRF fusion (default); "
+            "'all' = run each mode separately and concatenate results for comparison."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1135,210 +1157,498 @@ def build_image_suite_map() -> dict[str, list[dict]]:
     }
 
 
-def _force_full_pipeline_flags(test_cases: list[dict]) -> list[dict]:
-    """Ensure every regression case runs classify + query expansion paths."""
-    enriched: list[dict] = []
-    for case in test_cases:
-        row = dict(case)
-        row["classify"] = True
-        row["expand"] = True
-        row["num_expansions"] = max(int(row.get("num_expansions", 3)), 3)
-        enriched.append(row)
-    return enriched
+# ---------------------------------------------------------------------------
+# Corpus growth plans
+# ---------------------------------------------------------------------------
+#
+# A "corpus plan" is an ordered list of dicts, one per document.  Documents
+# are processed strictly in list order; each entry defines the document to
+# add at that step and the callable that returns its test cases.
+#
+# PDF_CORPUS_PLAN  — 13 digital PDFs indexed one by one.
+# IMAGE_CORPUS_PLAN — 5 scanned image folders indexed one by one.
+#
+# The order inside each plan matters: it determines which milestone index a
+# document receives, and therefore where it appears on the x-axis of the
+# growth-trend charts.  The order here matches build_combined_suite() and
+# build_image_suite() so that the test_ids are stable across all outputs.
+# ---------------------------------------------------------------------------
+
+PDF_CORPUS_PLAN: list[dict] = [
+    # Each entry: the document added at this step + its suite callable.
+    # "suite_fn" is called (not pre-called) so that each run gets a fresh
+    # copy of the test case list with no shared mutable state.
+    {"doc_name": "test_1.pdf",  "suite_fn": suite_test1},
+    {"doc_name": "test_2.pdf",  "suite_fn": suite_test2},
+    {"doc_name": "test_3.pdf",  "suite_fn": suite_test3},
+    {"doc_name": "test_4.pdf",  "suite_fn": suite_test4},
+    {"doc_name": "test_5.pdf",  "suite_fn": suite_test5},
+    {"doc_name": "test_7.pdf",  "suite_fn": suite_test7},
+    {"doc_name": "test_8.pdf",  "suite_fn": suite_test8},
+    {"doc_name": "test_9.pdf",  "suite_fn": suite_test9},
+    {"doc_name": "test_10.pdf", "suite_fn": suite_test10},
+    {"doc_name": "test_11.pdf", "suite_fn": suite_test11},
+    {"doc_name": "test_12.pdf", "suite_fn": suite_test12},
+    {"doc_name": "test_13.pdf", "suite_fn": suite_test13},
+    {"doc_name": "test_14.pdf", "suite_fn": suite_test14},
+]
+
+IMAGE_CORPUS_PLAN: list[dict] = [
+    {"doc_name": "image_test_1", "suite_fn": suite_image_test1},
+    {"doc_name": "image_test_2", "suite_fn": suite_image_test2},
+    {"doc_name": "image_test_3", "suite_fn": suite_image_test3},
+    {"doc_name": "image_test_4", "suite_fn": suite_image_test4},
+    {"doc_name": "image_test_5", "suite_fn": suite_image_test5},
+]
+
+
+# ---------------------------------------------------------------------------
+# Cumulative regression runner
+# ---------------------------------------------------------------------------
+
+def run_cumulative_regression(
+    plan: list[dict],
+    docs_dir: Path,
+    pipeline_kwargs: dict,
+    phase: str,
+    global_milestone_offset: int,
+    index_root: "Path | None",
+    latency_profile: str = "full",
+    retrieval_modes: "list[str] | None" = None,
+) -> object:
+    """Execute one full cumulative corpus-growth regression phase.
+
+    This function is the core orchestration loop.  It processes the entries in
+    ``plan`` one at a time, growing the corpus by one document per iteration.
+    At each step it:
+
+      1. **Appends** the new document path to the cumulative list.
+      2. **Rebuilds** the full index from *all* accumulated documents so far.
+         This simulates how a real deployment accumulates data over time: the
+         pipeline sees the same growing context that a production system would.
+      3. **Assembles** the test suite for *all* documents currently in the index
+         (not just the newly-added one).  Running tests for every indexed document
+         at every milestone is what separates proper regression from a simple
+         smoke test: you can detect when adding document N causes retrieval for
+         document M to degrade — cross-contamination.
+      4. **Executes** the suite via ``harness.run_at_milestone()``, which records
+         per-test metrics and stamps each row with the corpus state at that moment.
+      5. **Prints** a live progress summary so long runs produce visible output.
+
+    The function returns the concatenated milestone DataFrame covering all steps.
+    Call ``RAGRegressionHarness.summarize_milestones()`` on it for aggregates, and
+    ``RAGRegressionHarness.visualize_growth_trends()`` for the 6-panel chart.
+
+    Parameters
+    ----------
+    plan:
+        Ordered list of ``{"doc_name": str, "suite_fn": callable}`` dicts.
+        Documents are processed in this order; each entry adds one document.
+    docs_dir:
+        Root directory that contains the documents referenced in ``plan``.
+    pipeline_kwargs:
+        Keyword arguments forwarded verbatim to ``RAGPipeline()``.  Pass
+        ``{"model_path": "..."}`` when using a non-default LLM.
+    phase:
+        ``"pdf"`` or ``"images"`` — controls which pipeline build method is used
+        and which column value appears in the ``phase`` column of the output.
+    global_milestone_offset:
+        Added to the 1-based step index to produce a globally unique
+        ``milestone_index`` across both phases.  Pass 0 for the first phase
+        and ``len(PDF_CORPUS_PLAN)`` for the second phase so that the combined
+        DataFrame has a contiguous, non-repeating milestone sequence.
+    index_root:
+        Optional parent directory for the temporary persisted index.  When
+        ``None`` the OS default temp directory is used.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (test_case × milestone).  Columns include all standard
+        ``run()`` columns plus the milestone metadata columns added by
+        ``run_at_milestone``.
+    """
+    import pandas as pd  # local import: keep top-level imports minimal
+
+    # Lists that grow across iterations; each loop pass adds exactly one entry.
+    cumulative_paths: list[str] = []   # absolute paths of all indexed documents so far
+    all_applicable_tests: list[dict] = []  # test cases for all indexed documents so far
+    all_milestone_results: list[pd.DataFrame] = []  # one DataFrame per milestone
+
+    # Create a single temporary index directory that persists across the loop so
+    # that each rebuild writes over the previous index rather than creating a new
+    # temp folder, keeping disk usage bounded.
+    with tempfile.TemporaryDirectory(
+        dir=str(index_root) if index_root else None
+    ) as temp_index_root:
+        index_dir_path = Path(temp_index_root) / f"{phase}_cumulative"
+
+        for step_index, entry in enumerate(plan, start=1):
+            # ----------------------------------------------------------------
+            # Step metadata
+            # ----------------------------------------------------------------
+            doc_name = entry["doc_name"]
+            # milestone_index is globally unique across both phases so that the
+            # PDF and image DataFrames can be concatenated without collision.
+            milestone_index = global_milestone_offset + step_index
+            doc_path = str(docs_dir / doc_name)
+
+            # Resolve the test cases for the document being added at this step.
+            # calling suite_fn() each time ensures no shared list references.
+            new_tests: list[dict] = entry["suite_fn"]()
+            # The set of test_ids for *this* document only.  Passed to
+            # run_at_milestone so it can mark is_new_test correctly.
+            new_test_ids: set[str] = {t["test_id"] for t in new_tests}
+
+            # ----------------------------------------------------------------
+            # 1. Expand cumulative corpus
+            # ----------------------------------------------------------------
+            # Appending the path before the build call ensures the index always
+            # contains the current document and all prior ones.
+            cumulative_paths.append(doc_path)
+
+            # ----------------------------------------------------------------
+            # 2. Rebuild index with all accumulated documents
+            # ----------------------------------------------------------------
+            # A fresh RAGPipeline is created per milestone so there is no
+            # stale state from the previous build (caches, cached embeddings,
+            # or in-memory structures that don't get flushed on rebuild).
+            rag = RAGPipeline(**{**pipeline_kwargs, "persist_dir": str(index_dir_path)})
+
+            print(
+                f"\n[Milestone {milestone_index:2d}] Adding '{doc_name}' "
+                f"(corpus = {len(cumulative_paths)} {phase} doc(s))"
+            )
+
+            try:
+                if phase == "pdf":
+                    # build_from_multiple_pdfs: parses text from digital PDFs,
+                    # falls back to Tesseract OCR for scanned pages, chunks with
+                    # SentenceSplitter, embeds with HuggingFace, builds FAISS+BM25.
+                    rag.build_from_multiple_pdfs(
+                        cumulative_paths,
+                        classify_docs=True,
+                    )
+                else:
+                    # build_from_multiple_image_folders: runs Tesseract at 200 DPI
+                    # on every PNG in each folder, then the same indexing pipeline.
+                    rag.build_from_multiple_image_folders(
+                        cumulative_paths,
+                        classify_docs=True,
+                    )
+            except RuntimeError as exc:
+                # Tesseract not installed, GPU OOM, corrupt PDF, etc.
+                print(f"  ERROR building index at milestone {milestone_index}: {exc}", file=sys.stderr)
+                print("  Stopping phase early — subsequent milestones skipped.", file=sys.stderr)
+                break
+
+            # ----------------------------------------------------------------
+            # 3. Expand the cumulative test suite
+            # ----------------------------------------------------------------
+            # all_applicable_tests grows by exactly one document's worth of tests
+            # per iteration.  By milestone N it covers all N documents' tests,
+            # which is exactly the right scope: the retriever should be able to
+            # answer questions about any document currently in the index.
+            all_applicable_tests.extend(new_tests)
+
+            # Build the test list respecting the requested latency profile and
+            # retrieval modes.  When retrieval_modes has more than one entry every
+            # test is replicated once per mode so the results CSV contains a
+            # side-by-side comparison across modes.
+            _do_classify = latency_profile in ("retrieval_plus_classify", "full")
+            _do_expand   = latency_profile in ("retrieval_plus_expand",   "full")
+            _modes        = retrieval_modes if retrieval_modes else ["hybrid"]
+            full_flow_tests = [
+                {
+                    **t,
+                    "classify":       _do_classify,
+                    "expand":         _do_expand,
+                    "retrieval_mode": mode,
+                    "num_expansions": max(int(t.get("num_expansions", 3)), 3),
+                }
+                for mode in _modes
+                for t in all_applicable_tests
+            ]
+            suite_df = RAGRegressionHarness.create_test_suite(full_flow_tests)
+
+            # ----------------------------------------------------------------
+            # 4. Run all applicable tests and stamp milestone metadata
+            # ----------------------------------------------------------------
+            harness = RAGRegressionHarness(rag)
+            milestone_results = harness.run_at_milestone(
+                suite_df,
+                milestone_index=milestone_index,
+                doc_count=len(cumulative_paths),
+                doc_just_added=doc_name,
+                new_test_ids=new_test_ids,
+            )
+
+            # ----------------------------------------------------------------
+            # 5. Live progress summary
+            # ----------------------------------------------------------------
+            # Print a one-line summary immediately so long regressions (which
+            # can run for hours on a real model) show continuous output.
+            n_pass = int(milestone_results["passed"].sum())
+            n_total = len(milestone_results)
+            n_new = int(milestone_results["is_new_test"].sum())
+            n_existing = n_total - n_new
+            existing_pass = int(
+                milestone_results.loc[~milestone_results["is_new_test"], "passed"].sum()
+            ) if n_existing > 0 else 0
+
+            print(
+                f"  Tests: {n_total} total "
+                f"({n_new} new, {n_existing} existing)  "
+                f"Pass: {n_pass}/{n_total}"
+                + (f"  Existing pass: {existing_pass}/{n_existing}" if n_existing > 0 else "")
+            )
+
+            # Collect for concatenation after the loop.
+            all_milestone_results.append(milestone_results)
+
+    import pandas as pd
+
+    if not all_milestone_results:
+        # Return an empty DataFrame so the caller can handle an empty result
+        # without special-casing a None return value.
+        return pd.DataFrame()
+
+    combined = pd.concat(all_milestone_results, ignore_index=True)
+    # Tag every row with the phase label so that PDF and image results can be
+    # distinguished after they are combined into a single artifacts CSV.
+    combined["phase"] = phase
+    return combined
 
 
 def main() -> int:
+    """Orchestrate the two-phase cumulative corpus-growth regression.
+
+    Phase 1 — PDF: indexes test_1.pdf through test_14.pdf one by one.
+    Phase 2 — Images: indexes image_test_1 through image_test_5 one by one.
+
+    At each step ALL tests for documents currently in the index are re-run,
+    not just the tests for the newly-added document.  This is what makes the
+    regression "cumulative": you can observe how answer quality, retrieval
+    confidence, and latency evolve as the corpus grows, and detect cross-
+    contamination (a new document degrading retrieval for an older one).
+
+    Output artifacts
+    ----------------
+    artifacts/regression_results.csv
+        Raw per-test-per-milestone results for both phases combined.
+        One row per (test_case, milestone_index).  Suitable for custom
+        analysis in pandas, Excel, or any BI tool.
+
+    artifacts/regression_milestones_pdf.csv
+    artifacts/regression_milestones_images.csv
+        Per-milestone aggregate summary (pass rate, confidence, latency)
+        for each phase.  One row per milestone — ideal for quick review.
+
+    artifacts/regression_growth_pdf.png
+    artifacts/regression_growth_images.png
+        Six-panel growth-trend charts for each phase.
+
+    artifacts/regression_dashboard_pdf.png
+    artifacts/regression_dashboard_images.png
+        Single-run summary dashboard for the final (all-docs) milestone.
+
+    artifacts/baseline_comparison.csv  (optional)
+    artifacts/baseline_comparison_dashboard.png  (optional)
+        Diff against a previously-saved baseline CSV.
+    """
     args = parse_args()
 
     artifacts_dir = Path(args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     docs_dir = Path(args.docs_dir)
-    pipeline_kwargs = {}
+    pipeline_kwargs: dict = {}
     if args.model_path:
         pipeline_kwargs["model_path"] = args.model_path
 
-    index_dir = args.index_dir or ""
-    index_root = Path(index_dir) if index_dir else None
-
-    # ------------------------------------------------------------------
-    # Phase 1: PDF regression suite
-    # ------------------------------------------------------------------
-    pdf_files = sorted(docs_dir.glob("*.pdf"))
-    if not pdf_files:
-        print(f"ERROR: No PDF files found in {docs_dir.resolve()}", file=sys.stderr)
-        return 1
-
-    print(f"Running cumulative PDF regression across {len(pdf_files)} file(s):")
-    pdf_suite_map = build_pdf_suite_map()
-    per_pdf_results = []
-
-    shared_pdf_files = []
-    for pdf_file in pdf_files:
-        if pdf_file.name not in pdf_suite_map:
-            print(f"  SKIP {pdf_file.name}: no suite mapping found")
-            continue
-        shared_pdf_files.append(pdf_file)
-
-    if not shared_pdf_files:
-        print("ERROR: No PDF regression suites were executed.", file=sys.stderr)
-        return 1
-
-    with tempfile.TemporaryDirectory(dir=str(index_root) if index_root else None) as temp_index_root:
-        pdf_index_dir = Path(temp_index_root) / "pdf_cumulative"
-        seen_pdf_files: list[Path] = []
-
-        for pdf_file in shared_pdf_files:
-            seen_pdf_files.append(pdf_file)
-            print(f"  {pdf_file.name} (corpus size: {len(seen_pdf_files)})")
-
-            pdf_pipeline_kwargs = dict(pipeline_kwargs)
-            pdf_pipeline_kwargs["persist_dir"] = str(pdf_index_dir)
-
-            rag = RAGPipeline(**pdf_pipeline_kwargs)
-            rag.build_from_multiple_pdfs(
-                [str(seen_pdf_file) for seen_pdf_file in seen_pdf_files],
-                classify_docs=True,
-            )
-
-            harness = RAGRegressionHarness(rag)
-            suite_cases = pdf_suite_map[pdf_file.name]
-            full_flow_suite = _force_full_pipeline_flags(suite_cases)
-            suite_df = harness.create_test_suite(full_flow_suite)
-            file_results = harness.run(suite_df)
-            file_results["source_file"] = pdf_file.name
-            file_results["indexed_corpus_size"] = len(seen_pdf_files)
-            per_pdf_results.append(file_results)
-
-    if not per_pdf_results:
-        print("ERROR: No PDF regression suites were executed.", file=sys.stderr)
-        return 1
-
-    import pandas as pd
-    results_df = pd.concat(per_pdf_results, ignore_index=True)
-
-    results_csv = artifacts_dir / "regression_results.csv"
-    dashboard_png = artifacts_dir / "regression_dashboard.png"
-
-    harness.save_results(results_df, str(results_csv))
-    harness.visualize_results(
-        results_df,
-        str(dashboard_png),
-        title=f"RAG Regression — {len(pdf_files)} PDFs ({len(results_df)} Tests)",
-    )
-
-    summary = harness.summarize(results_df)
-    print("\nPDF regression summary:")
-    for key, value in summary.items():
-        print(f"  {key}: {value}")
-
-    print(f"\nSaved PDF results CSV  : {results_csv}")
-    print(f"Saved PDF dashboard PNG: {dashboard_png}")
+    index_root = Path(args.index_dir) if args.index_dir else None
 
     exit_code = 0
-    if summary.get("failed_tests", 0) > 0:
-        print(
-            f"ERROR: {summary['failed_tests']} PDF test(s) failed.",
-            file=sys.stderr,
+
+    # ------------------------------------------------------------------ #
+    # Phase 1: PDF corpus growth                                          #
+    # ------------------------------------------------------------------ #
+    # Verify that at least one expected PDF exists before starting.
+    first_pdf = docs_dir / "test_1.pdf"
+    if not first_pdf.exists():
+        print(f"ERROR: expected PDF not found: {first_pdf}", file=sys.stderr)
+        return 1
+
+    print(f"=== Phase 1: PDF regression ({len(PDF_CORPUS_PLAN)} documents) ===")
+
+    _retrieval_modes = (
+        ["bm25", "vector", "hybrid"] if args.retrieval_mode == "all" else [args.retrieval_mode]
+    )
+    pdf_milestone_df = run_cumulative_regression(
+        plan=PDF_CORPUS_PLAN,
+        docs_dir=docs_dir,
+        pipeline_kwargs=pipeline_kwargs,
+        phase="pdf",
+        # Milestone indices for Phase 1 start at 1 (offset = 0).
+        global_milestone_offset=0,
+        index_root=index_root,
+        latency_profile=args.latency_profile,
+        retrieval_modes=_retrieval_modes,
+    )
+
+    if not pdf_milestone_df.empty:
+        import pandas as pd
+
+        # Save the raw per-test-per-milestone results.
+        results_csv = artifacts_dir / "regression_results.csv"
+        RAGRegressionHarness.save_results(pdf_milestone_df, str(results_csv))
+        print(f"\nSaved PDF milestone results  : {results_csv}")
+
+        # Aggregate to one row per milestone for easy review.
+        pdf_summary_df = RAGRegressionHarness.summarize_milestones(pdf_milestone_df)
+        pdf_milestones_csv = artifacts_dir / "regression_milestones_pdf.csv"
+        RAGRegressionHarness.save_results(pdf_summary_df, str(pdf_milestones_csv))
+        print(f"Saved PDF milestone summary   : {pdf_milestones_csv}")
+
+        # Growth-trend chart: 6 panels covering pass rate, confidence, latency,
+        # heatmap, latency distribution, and source-count trend.
+        growth_png = artifacts_dir / "regression_growth_pdf.png"
+        RAGRegressionHarness.visualize_growth_trends(
+            pdf_milestone_df,
+            str(growth_png),
+            title=f"PDF Corpus Growth Regression — {len(PDF_CORPUS_PLAN)} documents",
         )
-        exit_code = 1
+        print(f"Saved PDF growth-trend chart  : {growth_png}")
 
-    # ------------------------------------------------------------------
-    # Phase 2: Image (OCR) regression suite
-    # ------------------------------------------------------------------
-    image_folders = sorted([d for d in docs_dir.iterdir() if d.is_dir() and d.name.startswith("image_test_")])
-    if image_folders:
-        print(f"\nRunning cumulative OCR regression for {len(image_folders)} image folder(s):")
-        image_results_list = []
+        # Single-run dashboard for the final milestone (all PDFs indexed).
+        final_milestone = int(pdf_milestone_df["milestone_index"].max())
+        final_pdf_results = pdf_milestone_df[
+            pdf_milestone_df["milestone_index"] == final_milestone
+        ].copy()
+        dashboard_png = artifacts_dir / "regression_dashboard_pdf.png"
+        RAGRegressionHarness.visualize_results(
+            final_pdf_results,
+            str(dashboard_png),
+            title=f"PDF Suite Dashboard — milestone {final_milestone} ({len(final_pdf_results)} tests)",
+        )
+        print(f"Saved PDF final dashboard     : {dashboard_png}")
 
-        image_suite_map = build_image_suite_map()
-        shared_image_folders = []
-
-        for folder in image_folders:
-            if folder.name not in image_suite_map:
-                print(f"  SKIP {folder.name}: no suite mapping found", file=sys.stderr)
-                continue
-            print(f"  {folder.name}")
-            shared_image_folders.append(folder)
-
-        if shared_image_folders:
-            with tempfile.TemporaryDirectory(dir=str(index_root) if index_root else None) as temp_index_root:
-                image_index_dir = Path(temp_index_root) / "image_cumulative"
-                seen_image_folders: list[Path] = []
-
-                for folder in shared_image_folders:
-                    seen_image_folders.append(folder)
-                    print(f"  {folder.name} (corpus size: {len(seen_image_folders)})")
-
-                    image_pipeline_kwargs = dict(pipeline_kwargs)
-                    image_pipeline_kwargs["persist_dir"] = str(image_index_dir)
-
-                    img_rag = RAGPipeline(**image_pipeline_kwargs)
-                    try:
-                        img_rag.build_from_multiple_image_folders(
-                            [str(seen_folder) for seen_folder in seen_image_folders],
-                            classify_docs=True,
-                        )
-                    except RuntimeError as exc:
-                        print(f"  SKIP OCR phase: {exc}", file=sys.stderr)
-                        image_results_list = []
-                        break
-
-                    img_harness = RAGRegressionHarness(img_rag)
-                    img_full_flow_suite = _force_full_pipeline_flags(image_suite_map[folder.name])
-                    img_suite_df = img_harness.create_test_suite(img_full_flow_suite)
-                    img_results = img_harness.run(img_suite_df)
-                    img_results["source_file"] = folder.name
-                    img_results["indexed_corpus_size"] = len(seen_image_folders)
-                    image_results_list.append(img_results)
-
-        if image_results_list:
-            import pandas as pd
-            all_image_results = pd.concat(image_results_list, ignore_index=True)
-            image_csv = artifacts_dir / "image_regression_results.csv"
-            image_png = artifacts_dir / "image_regression_dashboard.png"
-
-            RAGRegressionHarness.save_results(all_image_results, str(image_csv))
-            RAGRegressionHarness.visualize_results(
-                all_image_results,
-                str(image_png),
-                title=f"OCR Regression — {len(image_folders)} Folders ({len(all_image_results)} Tests)",
+        # Headline summary for the terminal.
+        pdf_summary = RAGRegressionHarness.summarize(final_pdf_results)
+        print("\nPDF phase summary (final milestone):")
+        for key, value in pdf_summary.items():
+            print(f"  {key}: {value}")
+        if pdf_summary.get("failed_tests", 0) > 0:
+            print(
+                f"ERROR: {pdf_summary['failed_tests']} PDF test(s) failed at final milestone.",
+                file=sys.stderr,
             )
+            exit_code = 1
+    else:
+        print("WARNING: PDF phase produced no results.", file=sys.stderr)
 
-            img_summary = RAGRegressionHarness.summarize(all_image_results)
-            print("\nOCR regression summary:")
+    # ------------------------------------------------------------------ #
+    # Phase 2: OCR / image-folder corpus growth                           #
+    # ------------------------------------------------------------------ #
+    # Image folders use a fresh pipeline instance (separate FAISS index)
+    # because the pipeline does not support mixing PDF and image sources in
+    # one build call.  Milestone indices continue from where Phase 1 left off
+    # so the combined CSV has a contiguous, non-repeating sequence.
+    first_image_folder = docs_dir / "image_test_1"
+    if not first_image_folder.exists():
+        print(f"\nNo image_test_1 folder found in {docs_dir.resolve()} — skipping OCR phase.")
+    else:
+        print(f"\n=== Phase 2: Image/OCR regression ({len(IMAGE_CORPUS_PLAN)} folders) ===")
+
+        image_milestone_df = run_cumulative_regression(
+            plan=IMAGE_CORPUS_PLAN,
+            docs_dir=docs_dir,
+            pipeline_kwargs=pipeline_kwargs,
+            phase="images",
+            # Phase 2 milestones continue numbering after Phase 1 ends.
+            global_milestone_offset=len(PDF_CORPUS_PLAN),
+            index_root=index_root,
+            latency_profile=args.latency_profile,
+            retrieval_modes=_retrieval_modes,
+        )
+
+        if not image_milestone_df.empty:
+            import pandas as pd
+
+            image_csv = artifacts_dir / "image_regression_results.csv"
+            RAGRegressionHarness.save_results(image_milestone_df, str(image_csv))
+            print(f"\nSaved image milestone results : {image_csv}")
+
+            img_summary_df = RAGRegressionHarness.summarize_milestones(image_milestone_df)
+            img_milestones_csv = artifacts_dir / "regression_milestones_images.csv"
+            RAGRegressionHarness.save_results(img_summary_df, str(img_milestones_csv))
+            print(f"Saved image milestone summary : {img_milestones_csv}")
+
+            img_growth_png = artifacts_dir / "regression_growth_images.png"
+            RAGRegressionHarness.visualize_growth_trends(
+                image_milestone_df,
+                str(img_growth_png),
+                title=f"Image/OCR Corpus Growth Regression — {len(IMAGE_CORPUS_PLAN)} folders",
+            )
+            print(f"Saved image growth-trend chart: {img_growth_png}")
+
+            final_img_milestone = int(image_milestone_df["milestone_index"].max())
+            final_img_results = image_milestone_df[
+                image_milestone_df["milestone_index"] == final_img_milestone
+            ].copy()
+            img_dashboard_png = artifacts_dir / "regression_dashboard_images.png"
+            RAGRegressionHarness.visualize_results(
+                final_img_results,
+                str(img_dashboard_png),
+                title=f"Image Suite Dashboard — milestone {final_img_milestone} ({len(final_img_results)} tests)",
+            )
+            print(f"Saved image final dashboard   : {img_dashboard_png}")
+
+            img_summary = RAGRegressionHarness.summarize(final_img_results)
+            print("\nImage phase summary (final milestone):")
             for key, value in img_summary.items():
                 print(f"  {key}: {value}")
-
-            print(f"\nSaved OCR results CSV  : {image_csv}")
-            print(f"Saved OCR dashboard PNG: {image_png}")
-
             if img_summary.get("failed_tests", 0) > 0:
                 print(
-                    f"ERROR: {img_summary['failed_tests']} OCR test(s) failed.",
+                    f"ERROR: {img_summary['failed_tests']} OCR test(s) failed at final milestone.",
                     file=sys.stderr,
                 )
                 exit_code = 1
-    else:
-        print(f"\nNo image_test_* folders found in {docs_dir.resolve()} — skipping OCR phase.")
 
-    # ------------------------------------------------------------------
-    # Phase 3: Baseline comparison (PDF results only)
-    # ------------------------------------------------------------------
-    if args.baseline:
-        baseline_df = harness.load_results(args.baseline)
-        comparison_df = harness.compare_to_baseline(results_df, baseline_df)
+    # ------------------------------------------------------------------ #
+    # Optional: baseline comparison against a previously-saved CSV        #
+    # ------------------------------------------------------------------ #
+    # Compares the final-milestone PDF results against a baseline snapshot
+    # to detect whether code changes (not corpus growth) caused regressions.
+    # Pass --baseline artifacts/baseline_results.csv to enable this step.
+    if args.baseline and Path(args.baseline).exists() and not pdf_milestone_df.empty:
+        import pandas as pd
+
+        baseline_df = RAGRegressionHarness.load_results(args.baseline)
+        # Use the final-milestone PDF results for the comparison so both sides
+        # reflect the same corpus state (all PDFs indexed).
+        final_milestone = int(pdf_milestone_df["milestone_index"].max())
+        final_pdf_results = pdf_milestone_df[
+            pdf_milestone_df["milestone_index"] == final_milestone
+        ].copy()
+
+        # Create a temporary harness just for the comparison (no pipeline needed).
+        _tmp_harness = RAGRegressionHarness(rag_pipeline=None)  # type: ignore[arg-type]
+        comparison_df = _tmp_harness.compare_to_baseline(final_pdf_results, baseline_df)
+
         comparison_csv = artifacts_dir / "baseline_comparison.csv"
         comparison_png = artifacts_dir / "baseline_comparison_dashboard.png"
-
         comparison_df.to_csv(comparison_csv, index=False)
-        harness.visualize_comparison(comparison_df, str(comparison_png))
+        RAGRegressionHarness.visualize_comparison(comparison_df, str(comparison_png))
 
         regressions = int(comparison_df["regression_detected"].sum())
-        print(f"Saved comparison CSV: {comparison_csv}")
-        print(f"Saved comparison PNG: {comparison_png}")
+        print(f"\nSaved baseline comparison CSV : {comparison_csv}")
+        print(f"Saved baseline comparison PNG : {comparison_png}")
         if regressions > 0:
-            print(f"ERROR: {regressions} regression(s) detected vs baseline.", file=sys.stderr)
+            print(
+                f"ERROR: {regressions} regression(s) detected vs baseline.",
+                file=sys.stderr,
+            )
             exit_code = 1
 
     return exit_code
