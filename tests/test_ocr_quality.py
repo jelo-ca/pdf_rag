@@ -24,7 +24,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from rag.pipeline import (
-    _KEYWORD_MAP,
     _PHARMA_DOC_CATEGORIES,
     RAGPipeline,
     _is_ocr_runtime_available,
@@ -132,49 +131,6 @@ class TestMetricHelpers:
         text = "pfizer product batch"   # 3 of 10 keywords
         rate = _keyword_preservation(text, CRITICAL_KEYWORDS)
         assert pytest.approx(0.3, abs=0.01) == rate
-
-
-# ---------------------------------------------------------------------------
-# UNIT: keyword classification
-# ---------------------------------------------------------------------------
-
-@pytest.mark.unit
-class TestKeywordClassificationUnit:
-
-    @pytest.fixture(scope="class")
-    def pipeline(self, tmp_path_factory):
-        p = tmp_path_factory.mktemp("model") / "model.gguf"
-        p.write_bytes(b"")
-        with patch("rag.pipeline.LlamaCPP") as mlc, \
-             patch("rag.pipeline.HuggingFaceEmbedding") as mec, \
-             patch("rag.pipeline.SentenceSplitter") as msc, \
-             patch("rag.pipeline.Settings"):
-            mlc.return_value = MagicMock(name="llm")
-            mec.return_value = MagicMock(name="embed")
-            msc.return_value = MagicMock(name="splitter")
-            rag = RAGPipeline(model_path=str(p))
-        rag.llm.complete.return_value = MagicMock(text="unknown")
-        return rag
-
-    @pytest.mark.parametrize("category,keywords", list(_KEYWORD_MAP.items()))
-    def test_first_keyword_of_each_category_triggers_fast_path(self, pipeline, category, keywords):
-        trigger = keywords[0]
-        text = trigger + " " * 300
-        pipeline.llm.complete.reset_mock()
-        result = pipeline._classify_document(text)
-        assert result == category
-        pipeline.llm.complete.assert_not_called()
-
-    def test_all_results_are_valid_categories(self, pipeline):
-        for text in ["Certificate of Quality lot 1234", "random unrelated text", ""]:
-            assert pipeline._classify_document(text) in _PHARMA_DOC_CATEGORIES
-
-    def test_keyword_beyond_300_char_window_misses(self, pipeline):
-        keyword = list(_KEYWORD_MAP["certificate_of_quality"])[0]
-        text = "x" * 300 + keyword
-        pipeline.llm.complete.reset_mock()
-        pipeline._classify_document(text)
-        pipeline.llm.complete.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

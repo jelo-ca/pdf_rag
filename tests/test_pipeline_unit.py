@@ -134,8 +134,8 @@ class TestComponentSpecs:
         _, kwargs = mock_llm.call_args
         assert kwargs.get("max_new_tokens") == 200
 
-    def test_llm_context_window_is_8192(self, fake_model_path):
-        """LLM must be initialised with context_window=8192."""
+    def test_llm_context_window_is_4096(self, fake_model_path):
+        """LLM must be initialised with context_window=4096."""
         from rag import RAGPipeline
         with patch("rag.pipeline.LlamaCPP") as mock_llm, \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
@@ -143,7 +143,7 @@ class TestComponentSpecs:
              patch("rag.pipeline.Settings"):
             RAGPipeline(model_path=fake_model_path)
         _, kwargs = mock_llm.call_args
-        assert kwargs.get("context_window") == 8192
+        assert kwargs.get("context_window") == 4096
 
     def test_llm_temperature_is_0_1(self, fake_model_path):
         """Low temperature (0.1) ensures deterministic, factual answers."""
@@ -244,10 +244,10 @@ class TestClassificationSystem:
         pipeline._classify_document(text)
         pipeline.llm.complete.assert_called_once()
 
-    def test_keyword_only_checked_in_first_300_chars(self, pipeline):
-        """Keyword starting at char 300 (outside window) → falls through to LLM."""
+    def test_keyword_only_checked_in_first_500_chars(self, pipeline):
+        """Keyword starting at char 500 (outside window) → falls through to LLM."""
         keyword = "certificate of quality"
-        text = "x" * 300 + keyword   # keyword starts outside the 300-char window
+        text = "x" * 500 + keyword   # keyword starts outside the 500-char window
         pipeline.llm.complete.reset_mock()
         pipeline._classify_document(text)
         pipeline.llm.complete.assert_called_once()
@@ -420,12 +420,32 @@ class TestQueryResponseStructure:
         r2 = built_pipeline.query_with_sources("What is the storage temperature?")
         assert r1 is r2  # same dict from cache
 
-    def test_different_queries_are_not_cached_together(self, built_pipeline):
+    def test_distinct_queries_produce_separate_cache_entries(self, built_pipeline):
+        """Two different queries must not share a cache slot."""
         r1 = built_pipeline.query_with_sources("What is the storage temperature?")
-        built_pipeline.clear_cache()
         r2 = built_pipeline.query_with_sources("What are the hazards?")
-        # Even after clear they are separate objects
-        assert r1["answer"] == r2["answer"]  # same mock, but different cache entries
+        assert r1 is not r2
+
+    def test_confidence_fallback_when_all_scores_are_none(self, built_pipeline):
+        """When every source_node has score=None, confidence uses 100/(rank+1)."""
+        null_node_a = _mock_source_node(text="page A", score=None)
+        null_node_b = _mock_source_node(text="page B", score=None)
+        null_node_a.score = None
+        null_node_b.score = None
+        built_pipeline._hybrid_engine.retrieve.return_value = [null_node_a, null_node_b]
+        built_pipeline.clear_cache()
+        result = built_pipeline.query_with_sources("storage temperature fallback?")
+        assert result["sources"][0]["score"] == pytest.approx(100.0)  # 100/1
+        assert result["sources"][1]["score"] == pytest.approx(50.0)   # 100/2
+
+    def test_query_with_sources_empty_retrieval_returns_zero_chunks(self, built_pipeline):
+        """When the retriever returns no nodes, sources is empty and chunk_count is 0."""
+        built_pipeline._hybrid_engine.retrieve.return_value = []
+        built_pipeline.clear_cache()
+        result = built_pipeline.query_with_sources("unanswerable ghost query?")
+        assert result["chunk_count"] == 0
+        assert result["sources"] == []
+        assert "answer" in result
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +501,32 @@ class TestGetStats:
         assert indexed_pipeline.get_stats()["classified"] is True
         indexed_pipeline._docs_classified = False
         assert indexed_pipeline.get_stats()["classified"] is False
+
+    def test_get_document_details_returns_one_entry_per_file(self, indexed_pipeline):
+        details = indexed_pipeline.get_document_details()
+        assert isinstance(details, list)
+        assert len(details) == 2  # test_1.pdf and test_2.pdf
+
+    def test_get_document_details_has_required_keys(self, indexed_pipeline):
+        required = {"file_name", "total_pages", "total_chunks", "has_ocr", "scan_ratio", "pharma_doc_types"}
+        for entry in indexed_pipeline.get_document_details():
+            missing = required - set(entry.keys())
+            assert not missing, f"{entry['file_name']} missing: {missing}"
+
+    def test_get_document_details_correct_chunk_counts(self, indexed_pipeline):
+        details = {e["file_name"]: e for e in indexed_pipeline.get_document_details()}
+        assert details["test_1.pdf"]["total_chunks"] == 5
+        assert details["test_2.pdf"]["total_chunks"] == 3
+
+    def test_get_document_details_scan_ratio_zero_for_digital_docs(self, indexed_pipeline):
+        """All fixture chunks are digital (ocr_used=False) — scan_ratio must be 0."""
+        for entry in indexed_pipeline.get_document_details():
+            assert entry["scan_ratio"] == pytest.approx(0.0)
+
+    def test_get_document_details_pharma_types_populated(self, indexed_pipeline):
+        details = {e["file_name"]: e for e in indexed_pipeline.get_document_details()}
+        assert "certificate_of_quality" in details["test_1.pdf"]["pharma_doc_types"]
+        assert "cover_letter" in details["test_2.pdf"]["pharma_doc_types"]
 
 
 # ---------------------------------------------------------------------------

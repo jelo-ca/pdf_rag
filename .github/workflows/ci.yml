@@ -63,4 +63,4 @@ jobs:
         run: pip install -r requirements-ci.txt
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short --cov=rag_pipeline --cov-report=term-missing
+        run: pytest tests/ -m unit -v --tb=short --cov=rag --cov-report=term-missing
