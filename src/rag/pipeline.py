@@ -171,6 +171,9 @@ _KEYWORD_MAP: Dict[str, List[str]] = {
         "cert. of quality",
         "coa ",
         "c.o.a",
+        "lot release",
+        "batch release",
+        "release certificate",
     ],
     "packaging_specification": [
         "packaging specification",
@@ -192,6 +195,12 @@ _KEYWORD_MAP: Dict[str, List[str]] = {
         "product description",
         "substance description",
         "raw material description",
+        "safety data sheet",
+        "material safety data sheet",
+        "msds",
+        "sds",
+        "section 1:",
+        "hazard identification",
     ],
     "supplier_qualification": [
         "supplier qualification",
@@ -303,8 +312,8 @@ class RAGPipeline:
             model_path=_model_path,
             temperature=0.1,
             max_new_tokens=200,
-            context_window=8192,
-            model_kwargs={"n_gpu_layers": _gpu_layers},
+            context_window=4096,
+            model_kwargs={"n_gpu_layers": _gpu_layers, "n_batch": 512},
             verbose=False,
         )
 
@@ -550,7 +559,7 @@ class RAGPipeline:
             similarity_top_k=self.similarity_top_k,
             num_queries=self.num_queries,
             mode="reciprocal_rerank",
-            use_async=False,
+            use_async=True,
             llm=self.llm,
         )
         logger.info("Hybrid retriever ready.")
@@ -628,7 +637,7 @@ class RAGPipeline:
             A snake_case category string from :data:`_PHARMA_DOC_CATEGORIES`.
         """
         # Stage 1: keyword scan on the page header (fast, no LLM)
-        header = text[:300].lower()
+        header = text[:500].lower()
         for cat, keywords in _KEYWORD_MAP.items():
             if any(kw in header for kw in keywords):
                 return cat
@@ -713,7 +722,7 @@ class RAGPipeline:
         # Stage 1: keyword scan on all pages (no LLM)
         needs_llm: List[int] = []
         for i, doc in enumerate(documents):
-            header = doc.text[:300].lower()
+            header = doc.text[:500].lower()
             matched = next(
                 (cat for cat, kws in _KEYWORD_MAP.items() if any(kw in header for kw in kws)),
                 None,
@@ -1447,6 +1456,7 @@ class RAGPipeline:
         response = engine.query(search_query)
         return str(response)
 
+    # pylint: disable-next=too-many-locals
     def query_with_sources(
         self,
         question: str,

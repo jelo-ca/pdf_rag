@@ -1,0 +1,12 @@
+Cell ID: cell-pypkgs
+Type: code
+================================================================================
+# ── Step 2: Python packages ───────────────────────────────────────────────────
+%pip install -q pymupdf
+%pip install -q "llama-index>=0.14.15" llama-index-core
+%pip install -q llama-index-embeddings-huggingface
+%pip install -q llama-index-llms-llama-cpp
+%pip install -q llama-index-retrievers-bm25
+%pip install -q sentence-transformers huggingface-hub
+%pip install -q pytesseract pillow
+%pip install -q "gradio>=6.0.0"

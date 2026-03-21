@@ -1,0 +1,4 @@
+profile,method,expand_ms_avg,classify_ms_avg,retrieve_ms_avg,generate_ms_avg,total_ms_avg,percent_expand,percent_classify,percent_retrieve,percent_generate
+retrieval_only,BM25-only,0.0,0.0,0.58,0.0,0.58,0.0,0.0,100.0,0.0
+retrieval_only,Vector-only,0.0,0.0,9.36,0.0,9.36,0.0,0.0,100.0,0.0
+retrieval_only,Hybrid (RRF),0.0,0.0,10.28,0.0,10.28,0.0,0.0,100.0,0.0

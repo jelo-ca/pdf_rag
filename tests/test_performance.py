@@ -1081,7 +1081,7 @@ def test_retrieval_latency_comparison(embedding_pipeline):
     box_data = [raw[m] for m in method_keys]
     bp = ax_dist.boxplot(
         box_data,
-        labels=method_keys,
+        tick_labels=method_keys,
         patch_artist=True,
         medianprops=dict(color="black", linewidth=2),
     )

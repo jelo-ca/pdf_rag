@@ -1,0 +1,15 @@
+Cell ID: cell-init
+Type: code
+================================================================================
+# ── Step 6: Initialize the pipeline ──────────────────────────────────────────
+# MODEL_PATH was set in Step 4. If you resumed this runtime and lost the
+# variable, re-run Step 4 first to restore it.
+
+_pipeline_ready = False
+
+rag = RAGPipeline(
+    model_path=MODEL_PATH,
+    persist_dir="/content/storage",
+)
+_pipeline_ready = rag._query_engine is not None
+print("RAGPipeline initialized.")

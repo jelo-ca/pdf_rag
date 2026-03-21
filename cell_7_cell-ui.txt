@@ -1,0 +1,507 @@
+Cell ID: cell-ui
+Type: code
+================================================================================
+# ── Step 7: Gradio UI ─────────────────────────────────────────────────────────
+# Launches a Gradio app with a public share URL.
+# Upload one or more pharmaceutical PDFs, click "Build Index", then ask questions.
+import gradio as gr
+
+_PHARMA_LABELS = {
+    "cover_letter": "Cover Letter",
+    "certificate_of_quality": "Certificate of Quality",
+    "packaging_specification": "Packaging Specification",
+    "bse_tse_declaration": "BSE / TSE Declaration",
+    "material_description": "Material Description",
+    "supplier_qualification": "Supplier Qualification",
+    "chain_of_custody": "Chain of Custody",
+    "unknown": "Unclassified",
+    "unclassified": "Unclassified",
+}
+
+
+def _scan_label(ratio: float) -> str:
+    if ratio <= 0:
+        return "Digital"
+    if ratio < 0.5:
+        return f"Mostly digital ({ratio:.0%} scanned)"
+    if ratio < 1.0:
+        return f"Mostly scanned ({ratio:.0%} scanned)"
+    return "Fully scanned (OCR)"
+
+
+def _format_document_panel(details: list) -> str:
+    if not details:
+        return "*No documents indexed yet.*"
+    lines = [f"**{len(details)} document(s) in index**\n"]
+    for doc in details:
+        fname = doc["file_name"]
+        lines.append(f"### {fname}\n")
+        lines.append("| Property | Value |")
+        lines.append("|---|---|")
+        lines.append(f"| Pages indexed | {doc['total_pages']} |")
+        lines.append(f"| Text chunks | {doc['total_chunks']} |")
+        lines.append(f"| Format | {_scan_label(doc['scan_ratio'])} |")
+        lines.append(f"| OCR applied | {'Yes' if doc['has_ocr'] else 'No'} |")
+        pharma_types = doc["pharma_doc_types"]
+        if pharma_types:
+            sorted_types = sorted(pharma_types.items(), key=lambda item: -item[1])
+            type_str = ", ".join(
+                f"{_PHARMA_LABELS.get(k, k)} ({v}p)" for k, v in sorted_types
+            )
+            lines.append(f"| Document categories | {type_str} |")
+        else:
+            lines.append("| Document categories | *(none detected)* |")
+        lines.append("\n---\n")
+    return "\n".join(lines)
+
+
+def build_pipeline(pdf_files, accumulated_files):
+    global _pipeline_ready
+    if pdf_files is None:
+        pdf_files = []
+    if not isinstance(pdf_files, list):
+        pdf_files = [pdf_files]
+    new_paths = [f.name if hasattr(f, "name") else f for f in pdf_files if f is not None]
+    existing_names = {os.path.basename(p) for p in accumulated_files}
+    for path in new_paths:
+        base = os.path.basename(path)
+        if base not in existing_names:
+            accumulated_files = accumulated_files + [path]
+            existing_names.add(base)
+    if not accumulated_files:
+        return (
+            "No files uploaded.",
+            "*Upload one or more PDFs and click **Build Index**.*",
+            "*No documents indexed yet.*",
+            accumulated_files,
+        )
+    try:
+        _pipeline_ready = False
+        progress_updates = []
+
+        def progress_callback(current, total, filename):
+            progress_updates.append(f"[ok] Loaded {current}/{total}: {filename}")
+
+        if len(accumulated_files) == 1:
+            rag.build(accumulated_files[0], classify_docs=True)
+            file_label = os.path.basename(accumulated_files[0])
+        else:
+            rag.build_from_multiple_pdfs(
+                accumulated_files, classify_docs=True, progress_callback=progress_callback,
+            )
+            file_label = f"{len(accumulated_files)} files"
+
+        _pipeline_ready = True
+        stats = rag.get_stats()
+        stats_md = (
+            f"| Stat | Value |\n|---|---|\n"
+            f"| Files | {stats.get('total_files', 1)} |\n"
+            f"| Pages | {stats['total_pages']} |\n"
+            f"| Chunks | {stats['total_chunks']} |\n"
+        )
+        if stats.get("classified") and stats.get("doc_type_counts"):
+            type_rows = "\n".join(
+                f"| &nbsp;&nbsp;`{_PHARMA_LABELS.get(dt, dt)}` | {cnt} pages |"
+                for dt, cnt in sorted(stats["doc_type_counts"].items())
+            )
+            stats_md += f"| **Document categories** | |\n{type_rows}\n"
+        else:
+            stats_md += "| Document categories | *(none detected)* |\n"
+        if progress_updates:
+            stats_md += "\n\n**Processing log:**\n\n"
+            stats_md += "\n".join(f"- {e}" for e in progress_updates)
+        docs_md = _format_document_panel(rag.get_document_details())
+        return f"Ready - {file_label} (classified)", stats_md, docs_md, accumulated_files
+    except Exception as exc:
+        import traceback
+        _pipeline_ready = False
+        return (
+            f"Error: {exc}",
+            f"```\n{traceback.format_exc()}\n```",
+            "*Error building document index.*",
+            accumulated_files,
+        )
+
+
+def clear_files():
+    global _pipeline_ready
+    _pipeline_ready = False
+    return (
+        [],
+        "No document loaded.",
+        "*Stats will appear here after building the index.*",
+        "*No documents indexed yet.*",
+    )
+
+
+def ask(question, history, classify, expand, num_expansions, top_k, filter_doc_type):
+    if not question.strip():
+        yield history, "", "*Ask a question above.*", ""
+        return
+    if not _pipeline_ready:
+        yield (
+            history + [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": "Please upload and build a document index first."},
+            ],
+            "", "*No sources - pipeline not ready.*", "",
+        )
+        return
+    original_top_k = rag.similarity_top_k
+    rag.similarity_top_k = top_k
+    streaming_history = history + [
+        {"role": "user", "content": question},
+        {"role": "assistant", "content": "_Thinking..._"},
+    ]
+    yield streaming_history, "", "*Retrieving sources...*", "Buffering response..."
+    final_payload = None
+    first_token_received = False
+    try:
+        for chunk in rag.stream_query_with_sources(
+            question, classify=classify, expand=expand, num_expansions=num_expansions,
+        ):
+            token = chunk.get("token")
+            if token is not None:
+                if not first_token_received:
+                    streaming_history[-1]["content"] = ""
+                    first_token_received = True
+                streaming_history[-1]["content"] += token
+                yield streaming_history, "", "*Retrieving sources...*", ""
+            else:
+                final_payload = chunk
+    except Exception as exc:
+        rag.similarity_top_k = original_top_k
+        yield (
+            history + [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": f"Error: {exc}"},
+            ],
+            "", "*Error during retrieval.*", "",
+        )
+        return
+    rag.similarity_top_k = original_top_k
+    if final_payload is None:
+        yield streaming_history, "", "*No response received.*", ""
+        return
+    if not streaming_history[-1]["content"].strip():
+        streaming_history[-1]["content"] = (
+            "_The model returned an empty response. "
+            "This can happen on the first inference call - please ask again._"
+        )
+        yield streaming_history, "", "*No answer generated - try again.*", ""
+        return
+    sources = final_payload["sources"]
+    query_category = final_payload["query_category"]
+    if filter_doc_type and filter_doc_type != "all":
+        sources = [s for s in sources if s.get("pharma_doc_type") == filter_doc_type]
+        if not sources:
+            yield (
+                streaming_history, "",
+                f"*No sources found for document type: {filter_doc_type}*", "",
+            )
+            return
+    sources_md = f"**{len(sources)} chunk(s) retrieved**"
+    if query_category:
+        query_label = _PHARMA_LABELS.get(query_category, query_category)
+        sources_md += f" &nbsp;-&nbsp; Query classified as: **`{query_label}`**"
+    if filter_doc_type and filter_doc_type != "all":
+        filter_label = _PHARMA_LABELS.get(filter_doc_type, filter_doc_type)
+        sources_md += f" &nbsp;-&nbsp; Filtered to: **`{filter_label}`**"
+    sources_md += "\n\n---\n\n"
+    for index, source in enumerate(sources, 1):
+        confidence = source["score"]
+        confidence_str = f"{confidence:.1f}%" if confidence is not None else "N/A"
+        pharma_label = _PHARMA_LABELS.get(source.get("pharma_doc_type", "unknown"), "Unclassified")
+        scan_label = _scan_label(1.0 if source["doc_type"] == "scanned" else 0.0)
+        snippet = source["text"][:300]
+        ellipsis = "..." if len(source["text"]) > 300 else ""
+        sources_md += (
+            f"**Source {index}** &nbsp;-&nbsp; "
+            f"`{source['file']}` &nbsp;-&nbsp; "
+            f"Page **{source['page']}** &nbsp;-&nbsp; "
+            f"Confidence: **{confidence_str}** &nbsp;-&nbsp; "
+            f"{scan_label} &nbsp;-&nbsp; "
+            f"**{pharma_label}**\n\n"
+            f"> {snippet}{ellipsis}\n\n"
+            f"---\n\n"
+        )
+    yield streaming_history, "", sources_md, ""
+
+
+PFIZER_CSS = """
+:root {
+    --pf-bg: #f7f8fb; --pf-surface: #ffffff; --pf-surface-alt: #f3f6fa;
+    --pf-border: #d9e1ea; --pf-text: #172132; --pf-muted: #526073;
+    --pf-primary: #005eb8; --pf-primary-strong: #004b92;
+    --pf-danger: #d4334f; --pf-radius: 10px;
+}
+.gradio-container {
+    font-family: 'Source Sans 3', 'IBM Plex Sans', 'Segoe UI', sans-serif;
+    background: var(--pf-bg); max-width: 1280px; color: var(--pf-text);
+}
+.pf-header {
+    background: var(--pf-surface); border: 1px solid var(--pf-border);
+    border-left: 5px solid var(--pf-primary); border-radius: var(--pf-radius);
+    padding: 16px 20px; margin-bottom: 16px;
+    display: flex; align-items: center; justify-content: space-between;
+}
+.pf-header-title { color: var(--pf-text); font-size: 1.25rem; font-weight: 700; margin: 0; }
+.pf-header-sub   { color: var(--pf-muted); font-size: 0.85rem; margin: 3px 0 0; }
+.pf-badge {
+    background: var(--pf-surface-alt); color: var(--pf-primary-strong);
+    border: 1px solid var(--pf-border); padding: 4px 10px; border-radius: 999px;
+    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+}
+.pf-section {
+    font-size: 0.68rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--pf-muted); margin: 0 0 10px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--pf-border);
+}
+.gradio-container .block, .gradio-container .gr-box,
+.gradio-container .gr-panel, .gradio-container .gr-accordion,
+.gradio-container details {
+    background: var(--pf-surface); border: 1px solid var(--pf-border);
+    border-radius: var(--pf-radius); color: var(--pf-text); box-shadow: none;
+}
+button.lg.primary, button.primary {
+    background: var(--pf-primary); border: 1px solid var(--pf-primary);
+    color: #ffffff; border-radius: 8px; font-weight: 600;
+}
+button.lg.primary:hover, button.primary:hover {
+    background: var(--pf-primary-strong); border-color: var(--pf-primary-strong);
+}
+button.stop, button.secondary {
+    background: var(--pf-surface); border: 1px solid var(--pf-border);
+    color: var(--pf-text); border-radius: 8px;
+}
+textarea, input[type="text"], .gradio-container select {
+    background: var(--pf-surface); color: var(--pf-text);
+    border: 1px solid var(--pf-border); border-radius: 8px;
+}
+textarea::placeholder, input[type="text"]::placeholder { color: var(--pf-muted); }
+#pf-chatbot {
+    border: 1px solid var(--pf-border); border-radius: var(--pf-radius);
+    background: var(--pf-surface);
+}
+#pf-chatbot .message-row.user-row .message, #pf-chatbot .user-row .message {
+    background: var(--pf-primary); color: #ffffff; border-radius: 12px 12px 2px 12px;
+}
+#pf-chatbot .message-row.bot-row .message, #pf-chatbot .bot-row .message {
+    background: #121212; border: 1px solid #202020;
+    color: #ffffff; border-radius: 12px 12px 12px 2px;
+}
+#pf-chatbot .message-row .message, #pf-chatbot .message-row .message *,
+#pf-chatbot .message-row .message p, #pf-chatbot .message-row .message span,
+#pf-chatbot .message-row .message strong, #pf-chatbot .message-row .message em,
+#pf-chatbot .message-row .message code { color: #ffffff !important; }
+.status-box textarea {
+    color: var(--pf-text); background: var(--pf-surface-alt); border-color: var(--pf-border);
+}
+.gradio-container .prose { color: var(--pf-text) !important; }
+.gradio-container .prose p, .gradio-container .prose li,
+.gradio-container .prose span { color: var(--pf-text) !important; }
+.gradio-container .prose strong { color: var(--pf-text) !important; font-weight: 700; }
+.gradio-container .prose em { color: var(--pf-muted) !important; }
+.gradio-container .prose code {
+    background: #e8f0f8 !important; color: var(--pf-primary-strong) !important;
+    padding: 2px 6px; border-radius: 4px; font-size: 0.9em;
+}
+.gradio-container .prose blockquote {
+    border-left: 3px solid var(--pf-border); color: var(--pf-text) !important;
+    font-style: italic; background: var(--pf-surface-alt); padding: 8px 12px; margin: 8px 0;
+}
+.gradio-container .prose h1, .gradio-container .prose h2,
+.gradio-container .prose h3, .gradio-container .prose h4 {
+    color: var(--pf-text) !important; font-weight: 700;
+}
+.gradio-container .prose hr { border-color: var(--pf-border) !important; }
+.gradio-container .prose table { border-collapse: collapse; width: 100%; }
+.gradio-container .prose table th, .gradio-container .prose table td {
+    background: var(--pf-text) !important; color: #ffffff !important;
+    border: 1px solid var(--pf-border); padding: 8px 12px;
+}
+.gradio-container .prose table th { font-weight: 700; }
+.gradio-container details > summary,
+.gradio-container details > summary span,
+.gradio-container details > summary button,
+.gradio-container details > summary * { color: #000000 !important; }
+.gradio-container label, .gradio-container label span,
+.gradio-container .label-wrap, .gradio-container .label-wrap span,
+.gradio-container .block-label, .gradio-container .block-label span { color: #000000 !important; }
+.gradio-container .gr-slider label, .gradio-container .gr-slider label span,
+.gradio-container .gr-dropdown label, .gradio-container .gr-dropdown label span,
+.gradio-container .gr-checkbox label, .gradio-container .gr-checkbox label span,
+.gradio-container .checkbox-label, .gradio-container .checkbox-label span { color: #000000 !important; }
+.gradio-container .info, .gradio-container .info span,
+.gradio-container .description, .gradio-container .description span { color: #000000 !important; }
+.gradio-container .upload-container span, .gradio-container .upload-container .wrap span,
+.gradio-container .file-drop-zone span, .gradio-container .file-upload-title,
+.gradio-container [data-testid="file"] span, .gradio-container .upload span,
+.gradio-container .upload-btn span { color: #000000 !important; }
+#pf-chatbot .placeholder, #pf-chatbot .placeholder p,
+#pf-chatbot .placeholder span, #pf-chatbot .placeholder *,
+#pf-chatbot [data-testid="empty-state"],
+#pf-chatbot [data-testid="empty-state"] p,
+#pf-chatbot [data-testid="empty-state"] * { color: #ffffff !important; }
+"""
+
+_PFIZER_THEME = gr.themes.Base(
+    primary_hue=gr.themes.colors.blue,
+    neutral_hue=gr.themes.colors.gray,
+    font=[
+        gr.themes.GoogleFont("Source Sans 3"),
+        gr.themes.GoogleFont("IBM Plex Sans"),
+        "Segoe UI", "sans-serif",
+    ],
+).set(
+    body_background_fill="#f7f8fb",
+    body_text_color="#172132",
+    body_text_color_subdued="#526073",
+    block_background_fill="#ffffff",
+    block_border_color="#d9e1ea",
+    block_border_width="1px",
+    block_radius="10px",
+    block_shadow="0 0 0 rgba(0,0,0,0)",
+    block_title_text_color="#172132",
+    block_label_text_color="#172132",
+    input_background_fill="#ffffff",
+    input_border_color="#d9e1ea",
+    input_border_color_focus="#005eb8",
+    input_placeholder_color="#526073",
+    button_primary_background_fill="#005eb8",
+    button_primary_background_fill_hover="#004b92",
+    button_primary_text_color="#ffffff",
+    button_secondary_background_fill="#ffffff",
+    button_secondary_border_color="#d9e1ea",
+    button_secondary_text_color="#172132",
+    checkbox_label_text_color="#172132",
+    checkbox_label_text_color_selected="#172132",
+    checkbox_background_color_selected="#005eb8",
+)
+
+with gr.Blocks(
+    title="Pfizer | Pharmaceutical Document QA",
+    css=PFIZER_CSS,
+    theme=_PFIZER_THEME,
+) as demo:
+    gr.HTML("""
+        <div class="pf-header">
+            <div>
+                <p class="pf-header-title">Pharmaceutical Document QA</p>
+                <p class="pf-header-sub">
+                    Upload pharmaceutical PDFs and ask questions - powered by hybrid RAG retrieval
+                    with automatic document classification
+                </p>
+            </div>
+            <span class="pf-badge">RAG System</span>
+        </div>
+    """)
+
+    accumulated_files_state = gr.State([])
+
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=2, min_width=300):
+            gr.HTML('<p class="pf-section">Documents</p>')
+            pdf_input = gr.File(label="Upload PDF(s)", file_types=[".pdf"], file_count="multiple")
+            with gr.Row():
+                build_btn = gr.Button("Build Index", variant="primary", size="lg", scale=3)
+                clear_btn = gr.Button("Clear", variant="stop", size="sm", scale=1)
+            with gr.Accordion("Document Details", open=True):
+                docs_display = gr.Markdown("*No documents indexed yet.*")
+            with gr.Accordion("Index Summary", open=False):
+                stats_display = gr.Markdown("*Stats will appear here after building the index.*")
+
+        with gr.Column(scale=3, min_width=420):
+            gr.HTML('<p class="pf-section">Query</p>')
+            chatbot = gr.Chatbot(
+                type="messages",
+                height=440, show_label=False, elem_id="pf-chatbot",
+                placeholder=(
+                    "<div style='text-align:center;padding:40px 20px'>"
+                    "<p style='font-size:1.1rem;font-weight:600;margin-bottom:6px;color:#ffffff'>"
+                    "No conversation yet</p>"
+                    "<p style='font-size:0.85rem;color:#ffffff'>"
+                    "Build the index and ask a question to get started.</p></div>"
+                ),
+            )
+            with gr.Row():
+                question_input = gr.Textbox(
+                    placeholder="e.g. What are the storage conditions for this batch?",
+                    show_label=False, scale=5, lines=1, max_lines=4, container=False,
+                )
+                ask_btn = gr.Button("Ask", variant="primary", scale=1, min_width=72)
+
+        with gr.Column(scale=2, min_width=320):
+            gr.HTML('<p class="pf-section">Info</p>')
+            status_box = gr.Textbox(
+                label="Status",
+                value="No document loaded." if not _pipeline_ready else "Ready - index loaded from disk.",
+                interactive=False, max_lines=2, elem_classes=["status-box"],
+            )
+            response_loading_box = gr.Textbox(
+                label="Response Status", value="",
+                placeholder="Response buffering state appears here...",
+                interactive=False, max_lines=1, elem_classes=["status-box"],
+            )
+            with gr.Accordion("Sources & Evidence", open=True):
+                sources_display = gr.Markdown(
+                    "*Sources and confidence scores will appear here after asking a question.*"
+                )
+            with gr.Accordion("Settings", open=False):
+                gr.Markdown("**Retrieval**")
+                top_k = gr.Slider(
+                    minimum=1, maximum=20, value=5, step=1, label="Chunks to retrieve (top-k)",
+                    info="Higher values provide more context but may slow inference.",
+                )
+                filter_doc_type = gr.Dropdown(
+                    choices=[
+                        ("All document types", "all"),
+                        ("Cover Letter", "cover_letter"),
+                        ("Certificate of Quality", "certificate_of_quality"),
+                        ("Packaging Specification", "packaging_specification"),
+                        ("BSE / TSE Declaration", "bse_tse_declaration"),
+                        ("Material Description", "material_description"),
+                        ("Supplier Qualification", "supplier_qualification"),
+                        ("Chain of Custody", "chain_of_custody"),
+                        ("Unclassified", "unknown"),
+                    ],
+                    value="all", label="Filter by document type",
+                    info="Requires classification to be enabled during indexing.",
+                )
+                gr.Markdown("**Query Processing**")
+                classify_query_toggle = gr.Checkbox(
+                    label="Auto-classify query", value=False,
+                    info="Uses the LLM to detect the most relevant document category.",
+                )
+                expand_query_toggle = gr.Checkbox(
+                    label="Query expansion", value=False,
+                    info="Generates alternative phrasings to improve retrieval recall.",
+                )
+                num_expansions = gr.Slider(
+                    minimum=1, maximum=5, value=3, step=1, label="Number of expansions",
+                    info="Only active when query expansion is enabled.",
+                )
+
+    build_btn.click(
+        build_pipeline, inputs=[pdf_input, accumulated_files_state],
+        outputs=[status_box, stats_display, docs_display, accumulated_files_state],
+    )
+    clear_btn.click(
+        clear_files, inputs=[],
+        outputs=[accumulated_files_state, status_box, stats_display, docs_display],
+    )
+    ask_btn.click(
+        ask,
+        inputs=[question_input, chatbot, classify_query_toggle, expand_query_toggle,
+                num_expansions, top_k, filter_doc_type],
+        outputs=[chatbot, question_input, sources_display, response_loading_box],
+    )
+    question_input.submit(
+        ask,
+        inputs=[question_input, chatbot, classify_query_toggle, expand_query_toggle,
+                num_expansions, top_k, filter_doc_type],
+        outputs=[chatbot, question_input, sources_display, response_loading_box],
+    )
+
+# share=True is required in Google Colab to generate a public tunnel URL
+demo.launch(share=True)

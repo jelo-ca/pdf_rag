@@ -6,6 +6,8 @@ This module provides a lightweight harness that:
 3) compares current runs to a baseline to flag regressions.
 """
 
+# pylint: disable=too-many-lines,too-many-locals,too-many-statements
+
 from __future__ import annotations
 
 import time
@@ -683,6 +685,7 @@ class RAGRegressionHarness:
 
         return pd.DataFrame(rows)
 
+    # pylint: disable-next=too-many-locals,too-many-statements
     @staticmethod
     def visualize_growth_trends(
         milestone_df: pd.DataFrame,
@@ -779,8 +782,8 @@ class RAGRegressionHarness:
         # Delay heavy imports so that importing this module in CI (where
         # matplotlib may run headless) does not trigger backend-selection
         # side-effects at module load time.
-        import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
         import matplotlib.colors as mcolors  # pylint: disable=import-outside-toplevel
+        import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
         import numpy as np  # pylint: disable=import-outside-toplevel
 
         out_path = Path(output_path)
