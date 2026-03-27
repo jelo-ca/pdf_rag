@@ -1,0 +1,39 @@
+flowchart TD
+    FAISS["VectorStoreIndex\n(FAISS)"]
+    NODES["Chunk nodes\n(BaseNode[])"]
+
+    %% ── INDIVIDUAL RETRIEVERS ────────────────────────────────────────
+    VEC_R["VectorIndexRetriever\ntop-k by cosine similarity"]
+    BM25_R["BM25Retriever\ntop-k by BM25 score"]
+
+    %% ── FUSION ───────────────────────────────────────────────────────
+    RRF["QueryFusionRetriever\nReciprocal Rank Fusion\nmode=reciprocal_rerank\nuse_async=True"]
+
+    %% ── ENGINE ───────────────────────────────────────────────────────
+    HYBRID_ENG["Hybrid QueryEngine\n_PHARMA_QA_PROMPT + Mistral GGUF"]
+
+    %% ── FILTERED ENGINE CACHE ────────────────────────────────────────
+    FILT_CACHE["Filtered engine cache\nDict[(pharma_doc_type)\n→ RetrieverQueryEngine]"]
+    FILT_ENG["_build_filtered_engine()\nMetadataFilter on pharma_doc_type\n+ BM25 pre-filtered node list"]
+
+    FAISS  --> VEC_R
+    NODES  --> BM25_R
+
+    VEC_R  --> RRF
+    BM25_R --> RRF
+    RRF    --> HYBRID_ENG
+
+    HYBRID_ENG --> FILT_ENG
+    FILT_ENG -.->|"cache write/read"| FILT_CACHE
+
+    note1["_finalize_engines() builds the hybrid engine\nafter every build() call.\nFiltered cache is cleared on rebuild."]
+
+    classDef storage  fill:#f3e8ff,stroke:#9333ea,color:#581c87
+    classDef process  fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef cache    fill:#fff7ed,stroke:#ea580c,color:#7c2d12
+    classDef note     fill:#f8fafc,stroke:#94a3b8,color:#475569,font-style:italic
+
+    class FAISS,NODES storage
+    class VEC_R,BM25_R,RRF,HYBRID_ENG,FILT_ENG process
+    class FILT_CACHE cache
+    class note1 note

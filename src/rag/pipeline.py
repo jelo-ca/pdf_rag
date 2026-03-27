@@ -5,12 +5,12 @@ Reusable RAG pipeline for document question-answering over PDFs.
 
 Architecture:
     PDF → Load (PyMuPDF + OCR fallback) → Fixed-size Chunk → Embed & Index (FAISS)
-    → Hybrid Retrieve (Vector + BM25, reciprocal rerank) → Prompt → Local LLM → Answer
+    → Hybrid Retrieve (Vector + BM25, reciprocal rerank) → Prompt → LLM (Gemini API or local) → Answer
 
 Embedding Model : sentence-transformers/all-MiniLM-L6-v2
 Chunking        : Fixed-size chunking (512 tokens, 50 overlap)
 Retrieval       : Hybrid – vector (FAISS) + BM25, fused via reciprocal rerank
-LLM             : Mistral GGUF (local, via llama-cpp-python)
+LLM             : Gemini (API) or Mistral GGUF (local, via llama-cpp-python)
 """
 
 # pylint: disable=too-many-lines
@@ -32,6 +32,7 @@ from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import QueryFusionRetriever, VectorIndexRetriever
 from llama_index.core.vector_stores.types import MetadataFilter, MetadataFilters
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.google_genai import GoogleGenAI
 from llama_index.llms.llama_cpp import LlamaCPP
 from llama_index.retrievers.bm25 import BM25Retriever
 
@@ -269,6 +270,8 @@ class RAGPipeline:
         num_queries: int = 1,
         n_gpu_layers: Optional[int] = None,
         persist_dir: Optional[str] = None,
+        llm_provider: Optional[str] = None,
+        gemini_model: Optional[str] = None,
     ) -> None:
         """Initialise the RAG pipeline by loading the LLM and embedding model.
 
@@ -290,32 +293,55 @@ class RAGPipeline:
             persist_dir: Directory path for persisting the vector index.
                 If provided, the index will be saved after building and loaded
                 on subsequent runs, eliminating rebuild time.
+            llm_provider: LLM backend provider. Supported values are
+                ``"gemini"`` and ``"local"``. Falls back to ``LLM_PROVIDER``
+                env var, then ``"gemini"``.
+            gemini_model: Gemini model name for API-backed inference.
+                Falls back to ``GEMINI_MODEL`` env var, then
+                ``"gemini-1.5-flash"``.
 
         Raises:
             FileNotFoundError: If the resolved ``model_path`` does not exist.
             ValueError: If no model path is provided and ``MODEL_PATH`` env var is unset.
         """
+        _provider = (llm_provider or os.getenv("LLM_PROVIDER", "gemini")).strip().lower()
         _model_path: str = (
             model_path or os.getenv("MODEL_PATH") or r"C:\LLM Models\Mistral\mistral-7b-instruct-v0.2.Q4_K_M.gguf"
         )
+        _gemini_model = gemini_model or os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
         _embed_model: str = embed_model_name or os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
         _top_k: int = similarity_top_k if similarity_top_k is not None else int(os.getenv("SIMILARITY_TOP_K", "5"))
         _gpu_layers: int = n_gpu_layers if n_gpu_layers is not None else int(os.getenv("N_GPU_LAYERS", "-1"))
 
-        if not os.path.exists(_model_path):
+        if _provider not in {"gemini", "local"}:
+            raise ValueError(f"Unsupported llm provider '{_provider}'. Use 'gemini' or 'local'.")
+
+        if _provider == "local" and not os.path.exists(_model_path):
             raise FileNotFoundError(f"GGUF model not found: {_model_path}")
 
         self.similarity_top_k: int = _top_k
         self.num_queries: int = num_queries
 
-        self.llm: LlamaCPP = LlamaCPP(
-            model_path=_model_path,
+        _gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not _gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is required for the document classifier.")
+        self.classifier_llm = GoogleGenAI(
+            model=_gemini_model,
+            api_key=_gemini_api_key,
             temperature=0.1,
-            max_new_tokens=200,
-            context_window=4096,
-            model_kwargs={"n_gpu_layers": _gpu_layers, "n_batch": 512},
-            verbose=False,
         )
+
+        if _provider == "gemini":
+            self.llm = self.classifier_llm
+        else:
+            self.llm = LlamaCPP(
+                model_path=_model_path,
+                temperature=0.1,
+                max_new_tokens=200,
+                context_window=4096,
+                model_kwargs={"n_gpu_layers": _gpu_layers, "n_batch": 512},
+                verbose=False,
+            )
 
         self.embed_model: HuggingFaceEmbedding = HuggingFaceEmbedding(
             model_name=_embed_model,
@@ -614,7 +640,7 @@ class RAGPipeline:
             f"Query: {query}\n"
             "Category:"
         )
-        response = self.llm.complete(prompt)
+        response = self.classifier_llm.complete(prompt)
         result = self._parse_category(response.text)
         logger.info("Query classified as: %s", result)
         return result
@@ -655,7 +681,7 @@ class RAGPipeline:
             f"Document text:\n{snippet}\n\n"
             "Category:"
         )
-        response = self.llm.complete(prompt)
+        response = self.classifier_llm.complete(prompt)
         return self._parse_category(response.text)
 
     def _classify_documents_batch(self, page_texts: List[str], batch_size: int = 5) -> List[str]:
@@ -694,7 +720,7 @@ class RAGPipeline:
                 f"{pages_block}"
                 "Categories (one per line):"
             )
-            response = self.llm.complete(prompt)
+            response = self.classifier_llm.complete(prompt)
             lines = [ln.strip() for ln in response.text.strip().splitlines() if ln.strip()]
 
             for idx in range(len(batch)):

@@ -9,11 +9,13 @@ llama-index-core>=0.14.15
 llama-index-embeddings-huggingface>=0.6.1
 llama-index-retrievers-bm25>=0.6.5
 llama-index-llms-llama-cpp
+llama-index-llms-google-genai
 
 # Local LLM inference (Mistral GGUF)
 # GPU (CUDA): CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python --force-reinstall
 # CPU only:   pip install llama-cpp-python
 llama-cpp-python
+google-generativeai
 
 # Embeddings
 sentence-transformers>=5.2.3

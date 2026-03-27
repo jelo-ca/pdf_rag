@@ -1,0 +1,39 @@
+flowchart TD
+    DOCS["Documents\n(classified or raw)"]
+
+    %% ── CHUNKING ─────────────────────────────────────────────────────
+    CHUNK["SentenceSplitter\n512 tokens · 50 token overlap\n_chunk()"]
+    NODES["Chunk nodes  (BaseNode[])"]
+
+    %% ── EMBEDDING ────────────────────────────────────────────────────
+    EMBED["HuggingFace Embeddings\nall-MiniLM-L6-v2\n(sentence-transformers)"]
+
+    %% ── INDEX STORES ─────────────────────────────────────────────────
+    FAISS["VectorStoreIndex\n(FAISS in-memory)"]
+    BM25_IDX["BM25 index\n(BM25Retriever.from_defaults)"]
+
+    %% ── PERSISTENCE (optional) ───────────────────────────────────────
+    PERSIST_CHK{"persist_dir\nset?"}
+    DISK["StorageContext.persist()\n→ disk (JSON)"]
+    LOAD_CHK{"existing index\non disk?"}
+    LOAD["load_index_from_storage()\nskip re-embedding"]
+
+    DOCS  --> CHUNK
+    CHUNK --> NODES
+    NODES --> EMBED
+    EMBED --> FAISS
+    NODES --> BM25_IDX
+
+    FAISS --> PERSIST_CHK
+    PERSIST_CHK -- "yes" --> DISK
+    PERSIST_CHK -- "no"  --> LOAD_CHK
+    LOAD_CHK    -- "yes" --> LOAD
+    LOAD_CHK    -- "no"  --> FAISS
+
+    classDef process  fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef decision fill:#fef9c3,stroke:#ca8a04,color:#713f12
+    classDef storage  fill:#f3e8ff,stroke:#9333ea,color:#581c87
+
+    class DOCS,NODES,FAISS,BM25_IDX storage
+    class CHUNK,EMBED,DISK,LOAD process
+    class PERSIST_CHK,LOAD_CHK decision

@@ -150,7 +150,7 @@ def ocr_pipeline(tmp_path_factory):
         mec.return_value = MagicMock(name="embed")
         msc.return_value = MagicMock(name="splitter")
         rag = RAGPipeline(model_path=str(p))
-    rag.llm.complete.return_value = MagicMock(text="unknown")
+    rag.classifier_llm.complete.return_value = MagicMock(text="unknown")
     return rag
 
 
@@ -267,9 +267,9 @@ class TestOCRClassification:
         import copy
         docs  = ocr_pipeline.load_images(str(DOCS_DIR / folder))
         docs2 = copy.deepcopy(docs)
-        ocr_pipeline.llm.complete.return_value = MagicMock(text="unknown")
+        ocr_pipeline.classifier_llm.complete.return_value = MagicMock(text="unknown")
         ocr_pipeline._annotate_pharma_doc_types(docs)
-        ocr_pipeline.llm.complete.return_value = MagicMock(text="unknown")
+        ocr_pipeline.classifier_llm.complete.return_value = MagicMock(text="unknown")
         ocr_pipeline._annotate_pharma_doc_types(docs2)
         for d1, d2 in zip(docs, docs2):
             assert d1.metadata["pharma_doc_type"] == d2.metadata["pharma_doc_type"], (

@@ -46,7 +46,7 @@ def pipeline(fake_model_path):
         mock_embed_cls.return_value = MagicMock(name="embed")
         mock_splitter_cls.return_value = MagicMock(name="splitter")
         rag = RAGPipeline(model_path=fake_model_path)
-    rag.llm.complete.return_value = MagicMock(text="unknown")
+    rag.classifier_llm.complete.return_value = MagicMock(text="unknown")
     return rag
 
 
@@ -232,25 +232,25 @@ class TestClassificationSystem:
     def test_keyword_hit_classifies_without_llm(self, pipeline, category, trigger_keyword):
         """Keyword present in header → correct category, zero LLM calls."""
         text = trigger_keyword + " " * 300
-        pipeline.llm.complete.reset_mock()
+        pipeline.classifier_llm.complete.reset_mock()
         result = pipeline._classify_document(text)
         assert result == category
-        pipeline.llm.complete.assert_not_called()
+        pipeline.classifier_llm.complete.assert_not_called()
 
     def test_no_keyword_falls_through_to_llm(self, pipeline):
-        """No keyword match → LLM is called exactly once."""
+        """No keyword match → classifier LLM is called exactly once."""
         text = "this document contains no recognisable pharmaceutical keyword signals " * 5
-        pipeline.llm.complete.reset_mock()
+        pipeline.classifier_llm.complete.reset_mock()
         pipeline._classify_document(text)
-        pipeline.llm.complete.assert_called_once()
+        pipeline.classifier_llm.complete.assert_called_once()
 
     def test_keyword_only_checked_in_first_500_chars(self, pipeline):
-        """Keyword starting at char 500 (outside window) → falls through to LLM."""
+        """Keyword starting at char 500 (outside window) → falls through to classifier LLM."""
         keyword = "certificate of quality"
         text = "x" * 500 + keyword   # keyword starts outside the 500-char window
-        pipeline.llm.complete.reset_mock()
+        pipeline.classifier_llm.complete.reset_mock()
         pipeline._classify_document(text)
-        pipeline.llm.complete.assert_called_once()
+        pipeline.classifier_llm.complete.assert_called_once()
 
     def test_result_always_a_valid_category(self, pipeline):
         """_classify_document must never return an arbitrary string."""
@@ -265,7 +265,7 @@ class TestClassificationSystem:
             Document(text="Certificate of Quality batch 123", metadata={}),
             Document(text="ambiguous content here " * 10, metadata={}),
         ]
-        pipeline.llm.complete.return_value = MagicMock(text="unknown")
+        pipeline.classifier_llm.complete.return_value = MagicMock(text="unknown")
         pipeline._annotate_pharma_doc_types(docs)
         for doc in docs:
             assert "pharma_doc_type" in doc.metadata
@@ -274,21 +274,21 @@ class TestClassificationSystem:
         """Pages classified by keyword must not trigger any LLM call."""
         from llama_index.core import Document
         docs = [Document(text="Certificate of Quality batch " * 5, metadata={})]
-        pipeline.llm.complete.reset_mock()
+        pipeline.classifier_llm.complete.reset_mock()
         pipeline._annotate_pharma_doc_types(docs)
-        pipeline.llm.complete.assert_not_called()
+        pipeline.classifier_llm.complete.assert_not_called()
 
     def test_batch_size_5_reduces_llm_calls(self, pipeline):
-        """N ambiguous pages → ceil(N/5) LLM calls (not N)."""
+        """N ambiguous pages → ceil(N/5) classifier LLM calls (not N)."""
         from llama_index.core import Document
         n = 13
         docs = [Document(text="ambiguous filler content " * 5, metadata={}) for _ in range(n)]
-        pipeline.llm.complete.reset_mock()
-        pipeline.llm.complete.return_value = MagicMock(
+        pipeline.classifier_llm.complete.reset_mock()
+        pipeline.classifier_llm.complete.return_value = MagicMock(
             text="\n".join(["unknown"] * 5)
         )
         pipeline._annotate_pharma_doc_types(docs)
-        assert pipeline.llm.complete.call_count == math.ceil(n / 5)
+        assert pipeline.classifier_llm.complete.call_count == math.ceil(n / 5)
 
     def test_parse_category_extracts_first_match(self, pipeline):
         """_parse_category must find the category even inside a longer response."""

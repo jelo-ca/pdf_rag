@@ -1,0 +1,38 @@
+flowchart TD
+    %% ── INPUT SOURCES ────────────────────────────────────────────────
+    subgraph INPUT["Input Sources"]
+        PDF["PDF file(s)"]
+        IMG["Image folder(s)\n(PNG / JPG / TIFF)"]
+    end
+
+    %% ── PDF PATH ─────────────────────────────────────────────────────
+    PYMUPDF["PyMuPDF\ntext extraction\nper page"]
+    SCAN_CHK{"page chars\n< 100?"}
+
+    %% ── IMAGE PATH ───────────────────────────────────────────────────
+    IMG2PDF["fitz: images → in-memory PDF\n(one page per image,\nsorted alphabetically)"]
+
+    %% ── SHARED OCR ───────────────────────────────────────────────────
+    OCR["Tesseract OCR\n@ 200 DPI\n_ocr_page()"]
+
+    %% ── OUTPUT ───────────────────────────────────────────────────────
+    DOCS["Documents\n{text, file_name, page_number,\ndoc_type, ocr_used, source_id}"]
+
+    PDF  --> PYMUPDF
+    PYMUPDF --> SCAN_CHK
+    SCAN_CHK -- "yes (scanned page)" --> OCR
+    SCAN_CHK -- "no  (digital page)" --> DOCS
+    OCR --> DOCS
+
+    IMG --> IMG2PDF
+    IMG2PDF --> OCR
+
+    classDef input    fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef process  fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef decision fill:#fef9c3,stroke:#ca8a04,color:#713f12
+    classDef storage  fill:#f3e8ff,stroke:#9333ea,color:#581c87
+
+    class PDF,IMG input
+    class PYMUPDF,OCR,IMG2PDF process
+    class SCAN_CHK decision
+    class DOCS storage

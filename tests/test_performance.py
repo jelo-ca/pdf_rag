@@ -291,7 +291,7 @@ def timing_pipeline(tmp_path_factory):
         msc.return_value = MagicMock(name="splitter")
         from rag import RAGPipeline
         rag = RAGPipeline(model_path=str(p))
-    rag.llm.complete.return_value = MagicMock(text="unknown")
+    rag.classifier_llm.complete.return_value = MagicMock(text="unknown")
     return rag
 
 

@@ -1,0 +1,59 @@
+flowchart TD
+    Q["User question"]
+
+    %% ── CACHE CHECK ──────────────────────────────────────────────────
+    CACHE{"result\ncached?\n(question, expand, classify,\nmode, top_k)"}
+
+    %% ── STAGE 1: QUERY EXPANSION ─────────────────────────────────────
+    EXPAND{"expand\n=True?"}
+    EXP_LLM["expand_query()\nLLM generates N paraphrases\n→ use queries[1] as search_query"]
+
+    %% ── STAGE 2: QUERY CLASSIFICATION ───────────────────────────────
+    CLASSIFY_Q{"classify\n=True?"}
+    QCAT["_classify_query()\nLLM → query_category\n(_PHARMA_DOC_CATEGORIES)"]
+    DOCS_CLASSIFIED{"docs were\nclassified\nat build?"}
+    FILT_ENG["_build_filtered_engine()\nscoped to query_category + mode\n(cached)"]
+
+    %% ── ENGINE ───────────────────────────────────────────────────────
+    HYBRID_ENG["Hybrid engine\n(RRF)"]
+
+    %% ── STAGE 3: RETRIEVAL ───────────────────────────────────────────
+    RETRIEVE["engine.retrieve(QueryBundle)\n→ source_nodes\n[timed: retrieve_ms]"]
+
+    %% ── STAGE 4: GENERATION ──────────────────────────────────────────
+    SYNTH["engine.synthesize()\nsource_nodes + _PHARMA_QA_PROMPT\n→ Mistral GGUF (LlamaCPP)\n[timed: generate_ms]"]
+
+    %% ── OUTPUT ───────────────────────────────────────────────────────
+    ANSWER["Structured result\n{answer, sources[], confidence %,\nquery_category, retrieval_mode,\nexpand_ms, classify_ms,\nretrieve_ms, generate_ms, total_ms}"]
+
+    Q            --> CACHE
+    CACHE     -- "hit"  --> ANSWER
+    CACHE     -- "miss" --> EXPAND
+
+    EXPAND    -- "yes"  --> EXP_LLM
+    EXPAND    -- "no"   --> CLASSIFY_Q
+    EXP_LLM              --> CLASSIFY_Q
+
+    CLASSIFY_Q -- "yes" --> QCAT
+    CLASSIFY_Q -- "no"  --> ENGINE_SEL
+    QCAT                 --> DOCS_CLASSIFIED
+    DOCS_CLASSIFIED -- "yes + category != unknown" --> FILT_ENG
+    DOCS_CLASSIFIED -- "no"                        --> HYBRID_ENG
+    FILT_ENG             --> HYBRID_ENG
+
+    HYBRID_ENG --> RETRIEVE
+
+    RETRIEVE --> SYNTH
+    SYNTH    --> ANSWER
+
+    classDef input    fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef process  fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef decision fill:#fef9c3,stroke:#ca8a04,color:#713f12
+    classDef engine   fill:#f3e8ff,stroke:#9333ea,color:#581c87
+    classDef output   fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+
+    class Q input
+    class EXP_LLM,QCAT,FILT_ENG,RETRIEVE,SYNTH process
+    class CACHE,EXPAND,CLASSIFY_Q,DOCS_CLASSIFIED decision
+    class HYBRID_ENG engine
+    class ANSWER output

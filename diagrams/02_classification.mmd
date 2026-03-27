@@ -1,0 +1,34 @@
+flowchart TD
+    DOCS["Documents\n(from ingestion)"]
+
+    %% ── STAGE 1: KEYWORD ─────────────────────────────────────────────
+    KW["Stage 1: keyword scan\ntext[:500].lower() vs _KEYWORD_MAP\n(7 categories, no LLM)"]
+    KW_MATCH{"keyword\nmatched?"}
+
+    %% ── STAGE 2: LLM ─────────────────────────────────────────────────
+    BATCH_LLM["Stage 2: batch LLM classification\n_classify_documents_batch()\nbatch_size=5  →  O(N/5) LLM calls"]
+    PARSE["_parse_category()\nnormalise + substring match\nvs _PHARMA_DOC_CATEGORIES"]
+
+    %% ── METADATA ─────────────────────────────────────────────────────
+    META["pharma_doc_type written\nto doc.metadata"]
+    FILTER_UNK["Filter: drop pages where\npharma_doc_type == 'unknown'"]
+
+    DOCS       --> KW
+    KW         --> KW_MATCH
+    KW_MATCH -- "yes → category"    --> META
+    KW_MATCH -- "no  → ambiguous"   --> BATCH_LLM
+    BATCH_LLM  --> PARSE
+    PARSE      --> META
+    META       --> FILTER_UNK
+
+    note1["Categories (_PHARMA_DOC_CATEGORIES):\ncover_letter · certificate_of_quality\npackaging_specification · bse_tse_declaration\nmaterial_description · sds · unknown"]
+
+    classDef process  fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef decision fill:#fef9c3,stroke:#ca8a04,color:#713f12
+    classDef storage  fill:#f3e8ff,stroke:#9333ea,color:#581c87
+    classDef note     fill:#f8fafc,stroke:#94a3b8,color:#475569,font-style:italic
+
+    class DOCS storage
+    class KW,BATCH_LLM,PARSE,META,FILTER_UNK process
+    class KW_MATCH decision
+    class note1 note
