@@ -4,11 +4,11 @@ RAG Pipeline
 Reusable RAG pipeline for document question-answering over PDFs.
 
 Architecture:
-    PDF → Load (PyMuPDF + OCR fallback) → Fixed-size Chunk → Embed & Index (FAISS)
-    → Hybrid Retrieve (Vector + BM25, reciprocal rerank) → Prompt → LLM (Gemini API or local) → Answer
+    PDF → Load (PyMuPDF + OCR fallback) → Sentence-Window Chunk → Embed & Index (FAISS)
+    → Hybrid Retrieve (Vector + BM25, reciprocal rerank) → Window Expand → Prompt → LLM (Gemini API or local) → Answer
 
 Embedding Model : sentence-transformers/all-MiniLM-L6-v2
-Chunking        : Fixed-size chunking (512 tokens, 50 overlap)
+Chunking        : Sentence-window chunking (1 sentence per node, ±3 sentence context window)
 Retrieval       : Hybrid – vector (FAISS) + BM25, fused via reciprocal rerank
 LLM             : Gemini (API) or Mistral GGUF (local, via llama-cpp-python)
 """
@@ -23,10 +23,12 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterator, List, Optional
 
 import fitz  # PyMuPDF
+import numpy as np
 import torch
 from dotenv import load_dotenv
 from llama_index.core import Document, QueryBundle, Settings, StorageContext, VectorStoreIndex, load_index_from_storage
-from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.node_parser import SentenceWindowNodeParser
+from llama_index.core.postprocessor import MetadataReplacementPostProcessor
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import QueryFusionRetriever, VectorIndexRetriever
@@ -34,6 +36,12 @@ from llama_index.core.vector_stores.types import MetadataFilter, MetadataFilters
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.google_genai import GoogleGenAI
 from llama_index.llms.llama_cpp import LlamaCPP
+
+try:
+    from llama_index.llms.ollama import Ollama
+except ImportError:
+    Ollama = None  # type: ignore
+
 from llama_index.retrievers.bm25 import BM25Retriever
 
 try:
@@ -272,6 +280,8 @@ class RAGPipeline:
         persist_dir: Optional[str] = None,
         llm_provider: Optional[str] = None,
         gemini_model: Optional[str] = None,
+        ollama_model: Optional[str] = None,
+        ollama_base_url: Optional[str] = None,
     ) -> None:
         """Initialise the RAG pipeline by loading the LLM and embedding model.
 
@@ -294,17 +304,23 @@ class RAGPipeline:
                 If provided, the index will be saved after building and loaded
                 on subsequent runs, eliminating rebuild time.
             llm_provider: LLM backend provider. Supported values are
-                ``"gemini"`` and ``"local"``. Falls back to ``LLM_PROVIDER``
-                env var, then ``"gemini"``.
+                ``"gemini"``, ``"local"``, and ``"ollama"``. Falls back to
+                ``LLM_PROVIDER`` env var, then ``"local"``.
             gemini_model: Gemini model name for API-backed inference.
                 Falls back to ``GEMINI_MODEL`` env var, then
                 ``"gemini-1.5-flash"``.
+            ollama_model: Ollama model name (e.g. ``"mistral"``,
+                ``"llama3.2"``). Falls back to ``OLLAMA_MODEL`` env var,
+                then ``"mistral"``. Only used when ``llm_provider="ollama"``.
+            ollama_base_url: Base URL for the Ollama server. Falls back to
+                ``OLLAMA_BASE_URL`` env var, then
+                ``"http://localhost:11434"``.
 
         Raises:
             FileNotFoundError: If the resolved ``model_path`` does not exist.
             ValueError: If no model path is provided and ``MODEL_PATH`` env var is unset.
         """
-        _provider = (llm_provider or os.getenv("LLM_PROVIDER", "gemini")).strip().lower()
+        _provider = (llm_provider or os.getenv("LLM_PROVIDER", "local")).strip().lower()
         _model_path: str = (
             model_path or os.getenv("MODEL_PATH") or r"C:\LLM Models\Mistral\mistral-7b-instruct-v0.2.Q4_K_M.gguf"
         )
@@ -312,9 +328,11 @@ class RAGPipeline:
         _embed_model: str = embed_model_name or os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
         _top_k: int = similarity_top_k if similarity_top_k is not None else int(os.getenv("SIMILARITY_TOP_K", "5"))
         _gpu_layers: int = n_gpu_layers if n_gpu_layers is not None else int(os.getenv("N_GPU_LAYERS", "-1"))
+        _ollama_model: str = ollama_model or os.getenv("OLLAMA_MODEL", "mistral")
+        _ollama_base_url: str = ollama_base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-        if _provider not in {"gemini", "local"}:
-            raise ValueError(f"Unsupported llm provider '{_provider}'. Use 'gemini' or 'local'.")
+        if _provider not in {"gemini", "local", "ollama"}:
+            raise ValueError(f"Unsupported llm provider '{_provider}'. Use 'gemini', 'local', or 'ollama'.")
 
         if _provider == "local" and not os.path.exists(_model_path):
             raise FileNotFoundError(f"GGUF model not found: {_model_path}")
@@ -333,27 +351,87 @@ class RAGPipeline:
 
         if _provider == "gemini":
             self.llm = self.classifier_llm
+        elif _provider == "ollama":
+            if Ollama is None:
+                raise ImportError(
+                    "Ollama LLM provider requires 'llama-index-llms-ollama'. "
+                    "Install it with: pip install llama-index-llms-ollama"
+                )
+            self.llm = Ollama(
+                model=_ollama_model,
+                base_url=_ollama_base_url,
+                temperature=0.1,
+                context_window=4096,
+                request_timeout=120.0,
+            )
+            logger.info(
+                "Ollama LLM: model=%s  base_url=%s  (GPU managed by Ollama server)",
+                _ollama_model,
+                _ollama_base_url,
+            )
         else:
+            try:
+                import llama_cpp as _llama_cpp
+                # llama_supports_gpu_offload() was deprecated in llama.cpp ~b3900
+                # and now always returns False even in CUDA builds.
+                # llama_max_devices() > 1 is the reliable indicator.
+                _gpu_build = (
+                    getattr(_llama_cpp, "llama_max_devices", lambda: 1)() > 1
+                )
+                if _gpu_layers != 0 and not _gpu_build:
+                    logger.warning(
+                        "llama-cpp-python was installed WITHOUT CUDA support — "
+                        "n_gpu_layers=%d will be ignored and inference will run on CPU. "
+                        "Reinstall with a CUDA wheel to enable GPU offload.",
+                        _gpu_layers,
+                    )
+                elif _gpu_build and _gpu_layers != 0:
+                    logger.info(
+                        "llama-cpp-python CUDA build confirmed — n_gpu_layers=%d"
+                        " (%s)",
+                        _gpu_layers,
+                        "all layers on GPU" if _gpu_layers == -1 else f"{_gpu_layers} layers on GPU",
+                    )
+            except Exception:
+                pass
+
             self.llm = LlamaCPP(
                 model_path=_model_path,
                 temperature=0.1,
                 max_new_tokens=200,
                 context_window=4096,
-                model_kwargs={"n_gpu_layers": _gpu_layers, "n_batch": 512},
+                model_kwargs={
+                    "n_gpu_layers": _gpu_layers,
+                    "n_batch": 512,
+                    "n_ctx": 4096,
+                },
                 verbose=False,
             )
 
+        _embed_device = "cuda" if torch.cuda.is_available() else "cpu"
         self.embed_model: HuggingFaceEmbedding = HuggingFaceEmbedding(
             model_name=_embed_model,
-            device="cuda" if torch.cuda.is_available() else "cpu",
+            device=_embed_device,
         )
+
+        if torch.cuda.is_available():
+            _gpu_name = torch.cuda.get_device_name(0)
+            _gpu_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+            logger.info(
+                "CUDA GPU detected: %s (%.1f GB VRAM) — embeddings on GPU",
+                _gpu_name,
+                _gpu_vram,
+            )
+        else:
+            logger.warning("CUDA not available — embeddings will run on CPU")
 
         Settings.embed_model = self.embed_model
         Settings.llm = self.llm
 
-        self._splitter: SentenceSplitter = SentenceSplitter(
-            chunk_size=512,
-            chunk_overlap=50,
+        self._splitter: SentenceWindowNodeParser = SentenceWindowNodeParser.from_defaults(
+            window_size=3,
+            window_metadata_key="window",
+            original_text_metadata_key="original_text",
         )
 
         self.persist_dir: Optional[str] = persist_dir
@@ -503,27 +581,31 @@ class RAGPipeline:
     # ------------------------------------------------------------------
 
     def _chunk(self, documents: List[Document]) -> List[Any]:
-        """Split documents into fixed-size chunks with overlap.
+        """Split documents into sentence-level nodes with surrounding context windows.
 
-        Uses :class:`~llama_index.core.node_parser.SentenceSplitter`
-        with a chunk size of 512 tokens and 50-token overlap.
+        Uses :class:`~llama_index.core.node_parser.SentenceWindowNodeParser`
+        to create one node per sentence.  Each node's ``window`` metadata key
+        stores the original sentence plus ``window_size=3`` surrounding sentences
+        on each side.  At query time, :class:`MetadataReplacementPostProcessor`
+        replaces the single-sentence node text with the full window, giving the
+        LLM richer context while keeping retrieval granular.
 
         Args:
             documents: List of :class:`~llama_index.core.Document` objects
                 produced by :meth:`load_pdf`.
 
         Returns:
-            A flat list of :class:`~llama_index.core.schema.BaseNode` chunks
-            ready for indexing.
+            A flat list of :class:`~llama_index.core.schema.BaseNode` sentence
+            nodes ready for indexing.
 
         Raises:
             ValueError: If ``documents`` is empty.
         """
         if not documents:
             raise ValueError("No documents provided for chunking.")
-        logger.info("Performing semantic chunking...")
+        logger.info("Performing sentence-window chunking...")
         chunks = self._splitter.get_nodes_from_documents(documents)
-        logger.info("Total chunks created: %d", len(chunks))
+        logger.info("Total sentence nodes created: %d", len(chunks))
         return chunks
 
     # ------------------------------------------------------------------
@@ -552,6 +634,51 @@ class RAGPipeline:
             logger.info("Index persisted to %s", self.persist_dir)
 
         return vector_index
+
+    # ------------------------------------------------------------------
+    # Cosine similarity
+    # ------------------------------------------------------------------
+
+    def _cosine_similarity(self, query: str, nodes: List[Any]) -> List[float]:
+        """Return cosine similarity between *query* and each node's embedding.
+
+        Uses ``get_query_embedding`` (the same call the vector retriever makes
+        internally) so the query vector lives in the same embedding space as the
+        stored chunk vectors.
+
+        Embedding priority per node:
+          1. Embedding stored in the vector store's ``embedding_dict``
+             (SimpleVectorStore) — the exact vector used during retrieval.
+          2. ``node.node.embedding`` if populated.
+          3. Re-embed ``node.node.text`` as a last resort.
+        """
+        query_vec = np.array(
+            self.embed_model.get_query_embedding(query), dtype=np.float32
+        )
+        q_norm = np.linalg.norm(query_vec)
+        if q_norm > 0:
+            query_vec /= q_norm
+
+        # Grab the stored embeddings from SimpleVectorStore when available so
+        # we use the exact same vectors as the retriever, not recomputed ones.
+        stored_embs: Dict[str, Any] = {}
+        if self._vector_index is not None:
+            vs = self._vector_index._vector_store
+            data = getattr(vs, "_data", None)
+            if data is not None:
+                stored_embs = getattr(data, "embedding_dict", {})
+
+        scores: List[float] = []
+        for node in nodes:
+            emb = stored_embs.get(node.node.node_id) or node.node.embedding
+            if emb is None:
+                emb = self.embed_model.get_text_embedding(node.node.text)
+            chunk_vec = np.array(emb, dtype=np.float32)
+            c_norm = np.linalg.norm(chunk_vec)
+            if c_norm > 0:
+                chunk_vec /= c_norm
+            scores.append(float(np.dot(query_vec, chunk_vec)))
+        return scores
 
     # ------------------------------------------------------------------
     # Retriever
@@ -778,6 +905,27 @@ class RAGPipeline:
         logger.info("Document classification complete.")
         return documents
 
+    def _make_query_engine(self, retriever: Any) -> RetrieverQueryEngine:
+        """Wrap a retriever in a :class:`RetrieverQueryEngine` with sentence-window expansion.
+
+        The :class:`~llama_index.core.postprocessor.MetadataReplacementPostProcessor`
+        replaces each retrieved sentence node's text with the full ``window``
+        metadata value (±3 surrounding sentences) before the LLM prompt is
+        assembled, providing richer context without sacrificing retrieval precision.
+
+        Args:
+            retriever: Any LlamaIndex retriever instance.
+
+        Returns:
+            A configured :class:`~llama_index.core.query_engine.RetrieverQueryEngine`.
+        """
+        return RetrieverQueryEngine.from_args(
+            retriever=retriever,
+            llm=self.llm,
+            text_qa_template=_PHARMA_QA_PROMPT,
+            node_postprocessors=[MetadataReplacementPostProcessor(target_metadata_key="window")],
+        )
+
     def _finalize_engines(self) -> None:
         """Precompute BM25-only and Vector-only engines alongside the hybrid engine.
 
@@ -791,12 +939,8 @@ class RAGPipeline:
         vec_r = VectorIndexRetriever(
             index=self._vector_index, similarity_top_k=self.similarity_top_k
         )
-        self._bm25_engine = RetrieverQueryEngine.from_args(
-            retriever=bm25_r, llm=self.llm, text_qa_template=_PHARMA_QA_PROMPT
-        )
-        self._vector_engine = RetrieverQueryEngine.from_args(
-            retriever=vec_r, llm=self.llm, text_qa_template=_PHARMA_QA_PROMPT
-        )
+        self._bm25_engine = self._make_query_engine(bm25_r)
+        self._vector_engine = self._make_query_engine(vec_r)
         self._hybrid_engine = self._query_engine
         self._filtered_engine_cache.clear()
         logger.debug("BM25-only and Vector-only engines precomputed.")
@@ -848,13 +992,9 @@ class RAGPipeline:
 
         if retrieval_mode == "bm25":
             retriever: Any = bm25_retriever or vector_retriever
-            engine = RetrieverQueryEngine.from_args(
-                retriever=retriever, llm=self.llm, text_qa_template=_PHARMA_QA_PROMPT
-            )
+            engine = self._make_query_engine(retriever)
         elif retrieval_mode == "vector":
-            engine = RetrieverQueryEngine.from_args(
-                retriever=vector_retriever, llm=self.llm, text_qa_template=_PHARMA_QA_PROMPT
-            )
+            engine = self._make_query_engine(vector_retriever)
         else:  # hybrid (default)
             retrievers: List[Any] = [vector_retriever] + ([bm25_retriever] if bm25_retriever else [])
             hybrid_retriever = QueryFusionRetriever(
@@ -865,11 +1005,7 @@ class RAGPipeline:
                 use_async=False,
                 llm=self.llm,
             )
-            engine = RetrieverQueryEngine.from_args(
-                retriever=hybrid_retriever,
-                llm=self.llm,
-                text_qa_template=_PHARMA_QA_PROMPT,
-            )
+            engine = self._make_query_engine(hybrid_retriever)
 
         self._filtered_engine_cache[cache_key] = engine
         return engine
@@ -956,11 +1092,7 @@ class RAGPipeline:
 
         hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
 
-        self._query_engine = RetrieverQueryEngine.from_args(
-            retriever=hybrid_retriever,
-            llm=self.llm,
-            text_qa_template=_PHARMA_QA_PROMPT,
-        )
+        self._query_engine = self._make_query_engine(hybrid_retriever)
         self._finalize_engines()
         self.clear_cache()
         logger.info("RAG pipeline ready.")
@@ -1005,11 +1137,7 @@ class RAGPipeline:
                 self._docs_classified = classify_docs
                 self._pdf_path = f"Multiple files ({len(pdf_paths)} PDFs)"
                 hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
-                self._query_engine = RetrieverQueryEngine.from_args(
-                    retriever=hybrid_retriever,
-                    llm=self.llm,
-                    text_qa_template=_PHARMA_QA_PROMPT,
-                )
+                self._query_engine = self._make_query_engine(hybrid_retriever)
                 self._finalize_engines()
                 self.clear_cache()
                 logger.info(
@@ -1054,11 +1182,7 @@ class RAGPipeline:
 
         # Build retriever and query engine
         hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
-        self._query_engine = RetrieverQueryEngine.from_args(
-            retriever=hybrid_retriever,
-            llm=self.llm,
-            text_qa_template=_PHARMA_QA_PROMPT,
-        )
+        self._query_engine = self._make_query_engine(hybrid_retriever)
 
         # Store list of PDF paths for stats
         self._pdf_path = f"Multiple files ({len(pdf_paths)} PDFs)"
@@ -1104,11 +1228,7 @@ class RAGPipeline:
                 self._docs_classified = classify_docs
                 self._pdf_path = f"Multiple image folders ({len(folder_paths)} folders)"
                 hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
-                self._query_engine = RetrieverQueryEngine.from_args(
-                    retriever=hybrid_retriever,
-                    llm=self.llm,
-                    text_qa_template=_PHARMA_QA_PROMPT,
-                )
+                self._query_engine = self._make_query_engine(hybrid_retriever)
                 self._finalize_engines()
                 self.clear_cache()
                 logger.info(
@@ -1152,11 +1272,7 @@ class RAGPipeline:
         self._vector_index = self._index(self._chunks)
 
         hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
-        self._query_engine = RetrieverQueryEngine.from_args(
-            retriever=hybrid_retriever,
-            llm=self.llm,
-            text_qa_template=_PHARMA_QA_PROMPT,
-        )
+        self._query_engine = self._make_query_engine(hybrid_retriever)
 
         self._pdf_path = f"Multiple image folders ({len(folder_paths)} folders)"
         self._finalize_engines()
@@ -1273,11 +1389,7 @@ class RAGPipeline:
         self._vector_index = self._index(self._chunks)
 
         hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
-        self._query_engine = RetrieverQueryEngine.from_args(
-            retriever=hybrid_retriever,
-            llm=self.llm,
-            text_qa_template=_PHARMA_QA_PROMPT,
-        )
+        self._query_engine = self._make_query_engine(hybrid_retriever)
         self._finalize_engines()
         self.clear_cache()
         logger.info("RAG pipeline ready from image folder: %s", folder_path)
@@ -1588,8 +1700,10 @@ class RAGPipeline:
         raw_scores = [n.score for n in source_nodes if n.score is not None]
         max_score = max(raw_scores) if raw_scores else 0.0
 
+        cosine_sims = self._cosine_similarity(search_query, source_nodes)
+
         sources: List[Dict[str, Any]] = []
-        for rank, node in enumerate(source_nodes):
+        for rank, (node, cos_sim) in enumerate(zip(source_nodes, cosine_sims)):
             meta = node.node.metadata
             if max_score > 0 and node.score is not None:
                 confidence = round((node.score / max_score) * 100, 1)
@@ -1601,6 +1715,8 @@ class RAGPipeline:
                     "file": meta.get("file_name", "unknown"),
                     "page": meta.get("page_number", "?"),
                     "score": confidence,
+                    "raw_score": round(node.score, 4) if node.score is not None else None,
+                    "cosine_similarity": round(cos_sim, 4),
                     "doc_type": meta.get("doc_type", "digital"),
                     "pharma_doc_type": meta.get("pharma_doc_type", "unknown"),
                 }
@@ -1674,9 +1790,11 @@ class RAGPipeline:
         raw_scores = [n.score for n in source_nodes if n.score is not None]
         max_score = max(raw_scores) if raw_scores else 0.0
 
+        cosine_sims = self._cosine_similarity(search_query, source_nodes)
+
         sources: List[Dict[str, Any]] = []
         context_parts: List[str] = []
-        for rank, node in enumerate(source_nodes):
+        for rank, (node, cos_sim) in enumerate(zip(source_nodes, cosine_sims)):
             meta = node.node.metadata
             confidence = (
                 round((node.score / max_score) * 100, 1) if max_score > 0 and node.score is not None
@@ -1688,6 +1806,8 @@ class RAGPipeline:
                     "file": meta.get("file_name", "unknown"),
                     "page": meta.get("page_number", "?"),
                     "score": confidence,
+                    "raw_score": round(node.score, 4) if node.score is not None else None,
+                    "cosine_similarity": round(cos_sim, 4),
                     "doc_type": meta.get("doc_type", "digital"),
                     "pharma_doc_type": meta.get("pharma_doc_type", "unknown"),
                 }

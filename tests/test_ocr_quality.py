@@ -144,11 +144,11 @@ def ocr_pipeline(tmp_path_factory):
     p.write_bytes(b"")
     with patch("rag.pipeline.LlamaCPP") as mlc, \
          patch("rag.pipeline.HuggingFaceEmbedding") as mec, \
-         patch("rag.pipeline.SentenceSplitter") as msc, \
+         patch("rag.pipeline.SentenceWindowNodeParser") as msc, \
          patch("rag.pipeline.Settings"):
         mlc.return_value = MagicMock(name="llm")
         mec.return_value = MagicMock(name="embed")
-        msc.return_value = MagicMock(name="splitter")
+        msc.from_defaults.return_value = MagicMock(name="splitter")
         rag = RAGPipeline(model_path=str(p))
     rag.classifier_llm.complete.return_value = MagicMock(text="unknown")
     return rag

@@ -2,7 +2,7 @@
 Unit Tests for RAGPipeline  (pipeline.py)
 ==========================================
 All tests use the 4-mock pattern: LlamaCPP, HuggingFaceEmbedding,
-SentenceSplitter, Settings are stubbed.  fitz and pytesseract are left real.
+SentenceWindowNodeParser, Settings are stubbed.  fitz and pytesseract are left real.
 
 Presentation coverage
 ---------------------
@@ -40,11 +40,11 @@ def pipeline(fake_model_path):
     from rag import RAGPipeline
     with patch("rag.pipeline.LlamaCPP") as mock_llm_cls, \
          patch("rag.pipeline.HuggingFaceEmbedding") as mock_embed_cls, \
-         patch("rag.pipeline.SentenceSplitter") as mock_splitter_cls, \
+         patch("rag.pipeline.SentenceWindowNodeParser") as mock_splitter_cls, \
          patch("rag.pipeline.Settings"):
         mock_llm_cls.return_value = MagicMock(name="llm")
         mock_embed_cls.return_value = MagicMock(name="embed")
-        mock_splitter_cls.return_value = MagicMock(name="splitter")
+        mock_splitter_cls.from_defaults.return_value = MagicMock(name="splitter")
         rag = RAGPipeline(model_path=fake_model_path)
     rag.classifier_llm.complete.return_value = MagicMock(text="unknown")
     return rag
@@ -77,36 +77,36 @@ class TestComponentSpecs:
     Component Specifications table on Slide 3 of the presentation.
     """
 
-    def test_chunk_size_is_512(self, fake_model_path):
-        """SentenceSplitter must be constructed with chunk_size=512."""
+    def test_window_size_is_3(self, fake_model_path):
+        """SentenceWindowNodeParser must be constructed with window_size=3."""
         from rag import RAGPipeline
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SentenceSplitter") as mock_splitter, \
+             patch("rag.pipeline.SentenceWindowNodeParser") as mock_splitter, \
              patch("rag.pipeline.Settings"):
-            mock_splitter.return_value = MagicMock()
+            mock_splitter.from_defaults.return_value = MagicMock()
             RAGPipeline(model_path=fake_model_path)
-        _, kwargs = mock_splitter.call_args
-        assert kwargs.get("chunk_size") == 512
+        _, kwargs = mock_splitter.from_defaults.call_args
+        assert kwargs.get("window_size") == 3
 
-    def test_chunk_overlap_is_50(self, fake_model_path):
-        """SentenceSplitter must be constructed with chunk_overlap=50."""
+    def test_window_metadata_key_is_window(self, fake_model_path):
+        """SentenceWindowNodeParser must use 'window' as the metadata key."""
         from rag import RAGPipeline
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SentenceSplitter") as mock_splitter, \
+             patch("rag.pipeline.SentenceWindowNodeParser") as mock_splitter, \
              patch("rag.pipeline.Settings"):
-            mock_splitter.return_value = MagicMock()
+            mock_splitter.from_defaults.return_value = MagicMock()
             RAGPipeline(model_path=fake_model_path)
-        _, kwargs = mock_splitter.call_args
-        assert kwargs.get("chunk_overlap") == 50
+        _, kwargs = mock_splitter.from_defaults.call_args
+        assert kwargs.get("window_metadata_key") == "window"
 
     def test_default_similarity_top_k_is_5(self, fake_model_path):
         """Default top-K for retrieval must be 5."""
         from rag import RAGPipeline
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SentenceSplitter"), \
+             patch("rag.pipeline.SentenceWindowNodeParser"), \
              patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path)
         assert rag.similarity_top_k == 5
@@ -116,7 +116,7 @@ class TestComponentSpecs:
         from rag import RAGPipeline
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding") as mock_embed, \
-             patch("rag.pipeline.SentenceSplitter"), \
+             patch("rag.pipeline.SentenceWindowNodeParser"), \
              patch("rag.pipeline.Settings"):
             mock_embed.return_value = MagicMock()
             RAGPipeline(model_path=fake_model_path)
@@ -128,7 +128,7 @@ class TestComponentSpecs:
         from rag import RAGPipeline
         with patch("rag.pipeline.LlamaCPP") as mock_llm, \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SentenceSplitter"), \
+             patch("rag.pipeline.SentenceWindowNodeParser"), \
              patch("rag.pipeline.Settings"):
             RAGPipeline(model_path=fake_model_path)
         _, kwargs = mock_llm.call_args
@@ -139,7 +139,7 @@ class TestComponentSpecs:
         from rag import RAGPipeline
         with patch("rag.pipeline.LlamaCPP") as mock_llm, \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SentenceSplitter"), \
+             patch("rag.pipeline.SentenceWindowNodeParser"), \
              patch("rag.pipeline.Settings"):
             RAGPipeline(model_path=fake_model_path)
         _, kwargs = mock_llm.call_args
@@ -150,7 +150,7 @@ class TestComponentSpecs:
         from rag import RAGPipeline
         with patch("rag.pipeline.LlamaCPP") as mock_llm, \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SentenceSplitter"), \
+             patch("rag.pipeline.SentenceWindowNodeParser"), \
              patch("rag.pipeline.Settings"):
             RAGPipeline(model_path=fake_model_path)
         _, kwargs = mock_llm.call_args
@@ -327,7 +327,7 @@ class TestPreBuildErrors:
         from rag import RAGPipeline
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
-             patch("rag.pipeline.SentenceSplitter"), \
+             patch("rag.pipeline.SentenceWindowNodeParser"), \
              patch("rag.pipeline.Settings"):
             with pytest.raises(FileNotFoundError):
                 RAGPipeline(model_path=str(tmp_path / "nonexistent.gguf"))

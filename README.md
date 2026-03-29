@@ -11,7 +11,7 @@ This repository provides:
 - A reusable Python package (`src/rag`) with `RAGPipeline`
 - PDF ingestion via PyMuPDF with OCR fallback for scanned pages
 - Image-folder ingestion via Tesseract OCR (`build_from_images`)
-- Fixed-size text chunking (`SentenceSplitter`, chunk size 512, overlap 50)
+- Fixed-size text chunking (`SentenceSplitter`, chunk size 128, overlap 16)
 - Hybrid retrieval (vector + BM25) fused with reciprocal rerank
 - Optional pharma document/page classification and query-time classification
 - Single-file and multi-file PDF indexing

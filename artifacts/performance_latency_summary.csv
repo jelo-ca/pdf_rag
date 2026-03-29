@@ -1,0 +1,4 @@
+metric,value
+Avg Retrieval Latency (ms),0.012
+Avg LLM Generation (ms),0.011
+Avg Total Response Time (ms),0.05

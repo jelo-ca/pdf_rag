@@ -29,6 +29,7 @@ dependencies = [
     "llama-index-embeddings-huggingface",
     "llama-index-llms-llama-cpp",
     "llama-index-llms-google-genai",
+    "llama-index-llms-ollama",
     "llama-index-retrievers-bm25",
     "llama-cpp-python",
     "sentence-transformers",

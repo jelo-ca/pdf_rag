@@ -1,0 +1,6 @@
+file,pages,load_ms,ms_per_10_pages
+test_1.pdf,13,37.51,28.86
+test_2.pdf,12,14.86,12.38
+test_3.pdf,12,14.79,12.33
+test_4.pdf,13,16.62,12.79
+test_5.pdf,10,5.88,5.88

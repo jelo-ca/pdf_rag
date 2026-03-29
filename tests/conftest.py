@@ -27,6 +27,8 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "integration: requires llama-index stack (no GPU)")
     config.addinivalue_line("markers", "ocr_scan: requires Tesseract binary on PATH")
     config.addinivalue_line("markers", "benchmark: timing/quality tests; writes artifacts/")
+    config.addinivalue_line("markers", "accuracy: end-to-end accuracy + system performance; requires real PDFs")
+    config.addinivalue_line("markers", "truthfulqa: TruthfulQA benchmark; downloads data + requires RAG_MODEL_PATH")
 
 
 def _available(module: str) -> bool:
@@ -50,6 +52,7 @@ if not _available("llama_index"):
         "llama_index",
         "llama_index.core",
         "llama_index.core.node_parser",
+        "llama_index.core.postprocessor",
         "llama_index.core.prompts",
         "llama_index.core.query_engine",
         "llama_index.core.retrievers",

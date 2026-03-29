@@ -1,0 +1,6 @@
+query,retrieve_ms,generate_ms,expand_ms,classify_ms,total_ms
+What is the product name or substance name of this material?,0.017,0.014,0.0,0.079,0.114
+What are the hazard classifications or GHS hazard statements,0.012,0.01,0.0,0.014,0.038
+What are the recommended storage conditions for this product,0.01,0.011,0.0,0.011,0.033
+What first aid measures should be taken in case of skin cont,0.011,0.008,0.0,0.01,0.03
+What personal protective equipment is required when handling,0.01,0.01,0.0,0.013,0.034
