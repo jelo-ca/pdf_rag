@@ -274,6 +274,7 @@ class RAGPipeline:
         >>> print(answer)
     """
 
+    # pylint: disable-next=too-many-locals,too-many-statements
     def __init__(
         self,
         model_path: Optional[str] = None,
@@ -375,7 +376,8 @@ class RAGPipeline:
             )
         else:
             try:
-                import llama_cpp as _llama_cpp
+                import llama_cpp as _llama_cpp  # pylint: disable=import-outside-toplevel
+
                 # llama_supports_gpu_offload() was deprecated in llama.cpp ~b3900
                 # and now always returns False even in CUDA builds.
                 # llama_max_devices() > 1 is the reliable indicator.
@@ -396,7 +398,7 @@ class RAGPipeline:
                         _gpu_layers,
                         "all layers on GPU" if _gpu_layers == -1 else f"{_gpu_layers} layers on GPU",
                     )
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
 
             self.llm = LlamaCPP(
@@ -704,7 +706,7 @@ class RAGPipeline:
         # we use the exact same vectors as the retriever, not recomputed ones.
         stored_embs: Dict[str, Any] = {}
         if self._vector_index is not None:
-            vs = self._vector_index._vector_store
+            vs = self._vector_index._vector_store  # pylint: disable=protected-access
             data = getattr(vs, "_data", None)
             if data is not None:
                 stored_embs = getattr(data, "embedding_dict", {})
@@ -1645,7 +1647,7 @@ class RAGPipeline:
         response = engine.query(search_query)
         return str(response)
 
-    # pylint: disable-next=too-many-locals
+    # pylint: disable-next=too-many-locals,too-many-statements
     def query_with_sources(
         self,
         question: str,
@@ -1743,18 +1745,18 @@ class RAGPipeline:
 
         # Retrieval relevance gate: if the best chunk is too dissimilar to the
         # query, skip LLM generation entirely — the corpus doesn't cover this topic.
-        _RELEVANCE_THRESHOLD = 0.15
+        relevance_threshold = 0.15
         cosine_sims = self._cosine_similarity(search_query, source_nodes)
         top_cosine = max(cosine_sims) if cosine_sims else 0.0
-        _OOC_REFUSAL = "This information is not available in the provided documents."
+        ooc_refusal = "This information is not available in the provided documents."
 
-        if top_cosine < _RELEVANCE_THRESHOLD:
+        if top_cosine < relevance_threshold:
             logger.debug(
                 "Relevance gate triggered (top cosine=%.3f < %.2f) — skipping LLM.",
-                top_cosine, _RELEVANCE_THRESHOLD,
+                top_cosine, relevance_threshold,
             )
             generate_ms = 0.0
-            answer = _OOC_REFUSAL
+            answer = ooc_refusal
         else:
             # Stage 4: answer generation
             t0 = time.perf_counter()
@@ -1764,25 +1766,25 @@ class RAGPipeline:
             except ValueError as exc:
                 if "exceed context window" in str(exc):
                     logger.warning("Context window exceeded — returning refusal.")
-                    answer = _OOC_REFUSAL
+                    answer = ooc_refusal
                 else:
                     raise
             generate_ms = (time.perf_counter() - t0) * 1_000
 
             # Answer grounding check: if the answer shares very few tokens with
             # the retrieved context, the model likely drew on parametric knowledge.
-            _GROUNDING_THRESHOLD = 0.05
+            grounding_threshold = 0.05
             context_text = " ".join(n.node.text for n in source_nodes)
             context_tokens = set(re.findall(r"[a-z]{3,}", context_text.lower()))
             answer_tokens = set(re.findall(r"[a-z]{3,}", answer.lower()))
             if context_tokens and answer_tokens:
                 grounding_overlap = len(answer_tokens & context_tokens) / len(answer_tokens)
-                if grounding_overlap < _GROUNDING_THRESHOLD:
+                if grounding_overlap < grounding_threshold:
                     logger.debug(
                         "Grounding check failed (overlap=%.3f < %.2f) — replacing with refusal.",
-                        grounding_overlap, _GROUNDING_THRESHOLD,
+                        grounding_overlap, grounding_threshold,
                     )
-                    answer = _OOC_REFUSAL
+                    answer = ooc_refusal
 
         total_ms = (time.perf_counter() - t_start) * 1_000
 

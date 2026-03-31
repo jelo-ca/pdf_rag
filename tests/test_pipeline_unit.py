@@ -26,6 +26,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _patch_env(monkeypatch):
+    """Ensure CI-safe env vars are set for every unit test in this module."""
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-test-key-for-ci")
+    monkeypatch.setenv("LLM_PROVIDER", "local")
+
+
 @pytest.fixture
 def fake_model_path(tmp_path):
     """Zero-byte file that satisfies os.path.exists inside RAGPipeline.__init__."""
@@ -41,10 +48,12 @@ def pipeline(fake_model_path):
     with patch("rag.pipeline.LlamaCPP") as mock_llm_cls, \
          patch("rag.pipeline.HuggingFaceEmbedding") as mock_embed_cls, \
          patch("rag.pipeline.SentenceWindowNodeParser") as mock_splitter_cls, \
+         patch("rag.pipeline.GoogleGenAI") as mock_google_cls, \
          patch("rag.pipeline.Settings"):
         mock_llm_cls.return_value = MagicMock(name="llm")
         mock_embed_cls.return_value = MagicMock(name="embed")
         mock_splitter_cls.from_defaults.return_value = MagicMock(name="splitter")
+        mock_google_cls.return_value = MagicMock(name="classifier_llm")
         rag = RAGPipeline(model_path=fake_model_path)
     rag.classifier_llm.complete.return_value = MagicMock(text="unknown")
     return rag
@@ -83,6 +92,7 @@ class TestComponentSpecs:
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
              patch("rag.pipeline.SentenceWindowNodeParser") as mock_splitter, \
+             patch("rag.pipeline.GoogleGenAI"), \
              patch("rag.pipeline.Settings"):
             mock_splitter.from_defaults.return_value = MagicMock()
             RAGPipeline(model_path=fake_model_path)
@@ -95,6 +105,7 @@ class TestComponentSpecs:
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
              patch("rag.pipeline.SentenceWindowNodeParser") as mock_splitter, \
+             patch("rag.pipeline.GoogleGenAI"), \
              patch("rag.pipeline.Settings"):
             mock_splitter.from_defaults.return_value = MagicMock()
             RAGPipeline(model_path=fake_model_path)
@@ -107,6 +118,7 @@ class TestComponentSpecs:
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
              patch("rag.pipeline.SentenceWindowNodeParser"), \
+             patch("rag.pipeline.GoogleGenAI"), \
              patch("rag.pipeline.Settings"):
             rag = RAGPipeline(model_path=fake_model_path)
         assert rag.similarity_top_k == 5
@@ -117,6 +129,7 @@ class TestComponentSpecs:
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding") as mock_embed, \
              patch("rag.pipeline.SentenceWindowNodeParser"), \
+             patch("rag.pipeline.GoogleGenAI"), \
              patch("rag.pipeline.Settings"):
             mock_embed.return_value = MagicMock()
             RAGPipeline(model_path=fake_model_path)
@@ -129,6 +142,7 @@ class TestComponentSpecs:
         with patch("rag.pipeline.LlamaCPP") as mock_llm, \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
              patch("rag.pipeline.SentenceWindowNodeParser"), \
+             patch("rag.pipeline.GoogleGenAI"), \
              patch("rag.pipeline.Settings"):
             RAGPipeline(model_path=fake_model_path)
         _, kwargs = mock_llm.call_args
@@ -140,6 +154,7 @@ class TestComponentSpecs:
         with patch("rag.pipeline.LlamaCPP") as mock_llm, \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
              patch("rag.pipeline.SentenceWindowNodeParser"), \
+             patch("rag.pipeline.GoogleGenAI"), \
              patch("rag.pipeline.Settings"):
             RAGPipeline(model_path=fake_model_path)
         _, kwargs = mock_llm.call_args
@@ -151,6 +166,7 @@ class TestComponentSpecs:
         with patch("rag.pipeline.LlamaCPP") as mock_llm, \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
              patch("rag.pipeline.SentenceWindowNodeParser"), \
+             patch("rag.pipeline.GoogleGenAI"), \
              patch("rag.pipeline.Settings"):
             RAGPipeline(model_path=fake_model_path)
         _, kwargs = mock_llm.call_args
@@ -328,6 +344,7 @@ class TestPreBuildErrors:
         with patch("rag.pipeline.LlamaCPP"), \
              patch("rag.pipeline.HuggingFaceEmbedding"), \
              patch("rag.pipeline.SentenceWindowNodeParser"), \
+             patch("rag.pipeline.GoogleGenAI"), \
              patch("rag.pipeline.Settings"):
             with pytest.raises(FileNotFoundError):
                 RAGPipeline(model_path=str(tmp_path / "nonexistent.gguf"))
