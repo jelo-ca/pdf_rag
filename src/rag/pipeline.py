@@ -17,6 +17,7 @@ LLM             : Gemini (API) or Mistral GGUF (local, via llama-cpp-python)
 
 import logging
 import os
+import re
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -134,6 +135,9 @@ _PHARMA_QA_PROMPT = PromptTemplate(
     "You are a pharmaceutical document assistant.\n"
     "Answer using ONLY the context below.\n"
     "Use exact terms, values, names, and numbers directly from the context — do not paraphrase or generalise.\n"
+    "If the context does not contain enough information to answer the question, respond only with: "
+    "'This information is not available in the provided documents.' "
+    "Do NOT use any outside knowledge or make assumptions.\n"
     "Format rules:\n"
     "  • DEFAULT: answer as a bullet list (one fact per bullet).\n"
     "  • Use prose ONLY when the question explicitly asks to explain, describe, or compare.\n"
@@ -446,6 +450,7 @@ class RAGPipeline:
         self._pdf_path: Optional[str] = None
         self._docs_classified: bool = False
         self._query_cache: Dict[tuple, Dict[str, Any]] = {}
+        self._document_counts: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # PDF Loading
@@ -575,6 +580,42 @@ class RAGPipeline:
 
         logger.info("Loaded '%s': %d pages with content.", file_name, len(documents))
         return documents
+
+    def _count_documents(self, documents: List[Document]) -> Dict[str, int]:
+        """Count pages per source file in a document list.
+
+        Args:
+            documents: List produced by :meth:`load_pdf` or :meth:`load_images`.
+
+        Returns:
+            Mapping of ``file_name`` → page count, e.g.
+            ``{"batch_release.pdf": 12, "sds_compound_a.pdf": 4}``.
+        """
+        counts: Dict[str, int] = {}
+        for doc in documents:
+            name = doc.metadata.get("file_name", "unknown")
+            counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    def _count_documents_from_chunks(self) -> Dict[str, int]:
+        """Rebuild per-source page counts from the current chunk list.
+
+        Used when the pipeline is loaded from a persisted index and the
+        original document list is no longer available.
+
+        Returns:
+            Mapping of ``file_name`` → unique page count derived from chunk
+            metadata.
+        """
+        seen: set = set()
+        counts: Dict[str, int] = {}
+        for chunk in self._chunks:
+            name = chunk.metadata.get("file_name")
+            page = chunk.metadata.get("page_number")
+            if name is not None and (name, page) not in seen:
+                seen.add((name, page))
+                counts[name] = counts.get(name, 0) + 1
+        return counts
 
     # ------------------------------------------------------------------
     # Chunking
@@ -1059,6 +1100,7 @@ class RAGPipeline:
 
         # Always re-read the PDF for fresh content used in query answering.
         documents = self.load_pdf(pdf_path)
+        self._document_counts = self._count_documents(documents)
         if classify_docs:
             if stored_classifications:
                 # Apply stored labels where available; run LLM only for new pages.
@@ -1139,6 +1181,7 @@ class RAGPipeline:
                 hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
                 self._query_engine = self._make_query_engine(hybrid_retriever)
                 self._finalize_engines()
+                self._document_counts = self._count_documents_from_chunks()
                 self.clear_cache()
                 logger.info(
                     "Pipeline ready from cache: %d chunks, %d PDFs.",
@@ -1165,6 +1208,7 @@ class RAGPipeline:
                 progress_callback(idx, len(pdf_paths), os.path.basename(pdf_path))
 
         logger.info("Loaded %d total pages from %d PDFs.", len(all_documents), len(pdf_paths))
+        self._document_counts = self._count_documents(all_documents)
 
         # Classify all documents together if requested
         if classify_docs:
@@ -1230,6 +1274,7 @@ class RAGPipeline:
                 hybrid_retriever = self._build_retriever(self._vector_index, self._chunks)
                 self._query_engine = self._make_query_engine(hybrid_retriever)
                 self._finalize_engines()
+                self._document_counts = self._count_documents_from_chunks()
                 self.clear_cache()
                 logger.info(
                     "OCR pipeline ready from cache: %d chunks, %d folders.",
@@ -1258,6 +1303,7 @@ class RAGPipeline:
             raise ValueError("No text extracted from the provided image folders.")
 
         logger.info("Loaded %d total OCR pages from %d folders.", len(all_documents), len(folder_paths))
+        self._document_counts = self._count_documents(all_documents)
 
         if classify_docs:
             all_documents = self._annotate_pharma_doc_types(all_documents)
@@ -1374,6 +1420,7 @@ class RAGPipeline:
         if not documents:
             raise ValueError(f"No text extracted from images in {folder_path!r}.")
 
+        self._document_counts = self._count_documents(documents)
         if classify_docs:
             documents = self._annotate_pharma_doc_types(documents)
             before = len(documents)
@@ -1412,6 +1459,9 @@ class RAGPipeline:
               chunk count. Only populated when the index was built with
               ``classify_docs=True``; otherwise contains ``{"unclassified": N}``.
             - ``classified`` (*bool*) – Whether document classification was run.
+            - ``document_counts`` (*dict*) – Mapping of ``file_name`` → page count
+              reflecting the number of distinct source documents and their page
+              contributions in the loaded blob.
 
         Raises:
             RuntimeError: If :meth:`build` has not been called yet.
@@ -1450,6 +1500,7 @@ class RAGPipeline:
             "file_names": sorted(list(file_names)),
             "doc_type_counts": doc_type_counts,
             "classified": self._docs_classified,
+            "document_counts": dict(sorted(self._document_counts.items())),
         }
 
     def get_document_details(self) -> List[Dict[str, Any]]:
@@ -1690,17 +1741,53 @@ class RAGPipeline:
         source_nodes = engine.retrieve(query_bundle)
         retrieve_ms = (time.perf_counter() - t0) * 1_000
 
-        # Stage 4: answer generation
-        t0 = time.perf_counter()
-        response = engine.synthesize(query_bundle, source_nodes)
-        generate_ms = (time.perf_counter() - t0) * 1_000
+        # Retrieval relevance gate: if the best chunk is too dissimilar to the
+        # query, skip LLM generation entirely — the corpus doesn't cover this topic.
+        _RELEVANCE_THRESHOLD = 0.15
+        cosine_sims = self._cosine_similarity(search_query, source_nodes)
+        top_cosine = max(cosine_sims) if cosine_sims else 0.0
+        _OOC_REFUSAL = "This information is not available in the provided documents."
+
+        if top_cosine < _RELEVANCE_THRESHOLD:
+            logger.debug(
+                "Relevance gate triggered (top cosine=%.3f < %.2f) — skipping LLM.",
+                top_cosine, _RELEVANCE_THRESHOLD,
+            )
+            generate_ms = 0.0
+            answer = _OOC_REFUSAL
+        else:
+            # Stage 4: answer generation
+            t0 = time.perf_counter()
+            try:
+                response = engine.synthesize(query_bundle, source_nodes)
+                answer = str(response)
+            except ValueError as exc:
+                if "exceed context window" in str(exc):
+                    logger.warning("Context window exceeded — returning refusal.")
+                    answer = _OOC_REFUSAL
+                else:
+                    raise
+            generate_ms = (time.perf_counter() - t0) * 1_000
+
+            # Answer grounding check: if the answer shares very few tokens with
+            # the retrieved context, the model likely drew on parametric knowledge.
+            _GROUNDING_THRESHOLD = 0.05
+            context_text = " ".join(n.node.text for n in source_nodes)
+            context_tokens = set(re.findall(r"[a-z]{3,}", context_text.lower()))
+            answer_tokens = set(re.findall(r"[a-z]{3,}", answer.lower()))
+            if context_tokens and answer_tokens:
+                grounding_overlap = len(answer_tokens & context_tokens) / len(answer_tokens)
+                if grounding_overlap < _GROUNDING_THRESHOLD:
+                    logger.debug(
+                        "Grounding check failed (overlap=%.3f < %.2f) — replacing with refusal.",
+                        grounding_overlap, _GROUNDING_THRESHOLD,
+                    )
+                    answer = _OOC_REFUSAL
 
         total_ms = (time.perf_counter() - t_start) * 1_000
 
         raw_scores = [n.score for n in source_nodes if n.score is not None]
         max_score = max(raw_scores) if raw_scores else 0.0
-
-        cosine_sims = self._cosine_similarity(search_query, source_nodes)
 
         sources: List[Dict[str, Any]] = []
         for rank, (node, cos_sim) in enumerate(zip(source_nodes, cosine_sims)):
@@ -1723,7 +1810,7 @@ class RAGPipeline:
             )
 
         result = {
-            "answer": str(response),
+            "answer": answer,
             "sources": sources,
             "chunk_count": len(sources),
             "query_category": query_category,

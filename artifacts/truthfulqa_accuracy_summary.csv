@@ -1,0 +1,12 @@
+metric,value
+Questions Evaluated,99
+Correct (truthful_pass),10
+Incorrect,-1
+Grounded Refusals,90
+Hallucinations,2
+Accuracy %,10.1
+Refusal %,90.9
+Hallucination %,2.0
+Avg Truthful Overlap,0.085
+Avg False Overlap,0.085
+Avg Response Time (ms),33920.69
