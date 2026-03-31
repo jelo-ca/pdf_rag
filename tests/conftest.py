@@ -61,6 +61,7 @@ if not _available("llama_index"):
         "llama_index.embeddings",
         "llama_index.embeddings.huggingface",
         "llama_index.llms",
+        "llama_index.llms.google_genai",
         "llama_index.llms.llama_cpp",
         "llama_index.retrievers",
         "llama_index.retrievers.bm25",
